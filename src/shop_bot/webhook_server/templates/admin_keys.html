@@ -1,0 +1,807 @@
+{% extends "base.html" %} {% block title %}Админ — Ключи{% endblock %}
+{% block content %}
+<div class="page-header d-print-none">
+  <div class="row align-items-center">
+    <div class="col">
+      <h2 class="page-title">Ключи</h2>
+      <div class="text-secondary">Просмотр, создание, удаление и редактирование комментариев</div>
+    </div>
+  </div>
+</div>
+
+<div class="card glass mb-3">
+  <div class="card-body">
+    <!-- Mode Switcher -->
+    <div class="mb-3">
+      <div class="btn-group w-100" role="group">
+        <input type="radio" class="btn-check" name="mode_switch" id="mode_personal" value="personal" checked autocomplete="off">
+        <label class="btn btn-outline-primary" for="mode_personal">👤 Пользователю (Personal)</label>
+
+        <input type="radio" class="btn-check" name="mode_switch" id="mode_gift" value="gift" autocomplete="off">
+        <label class="btn btn-outline-success" for="mode_gift">🎁 Подарочный (Gift Key)</label>
+      </div>
+    </div>
+
+    <form action="{{ url_for('create_key_ajax_route') }}" method="post" class="row g-2 align-items-end" id="create-key-form" autocomplete="off">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+      <input type="hidden" name="mode" id="form_mode" value="personal" />
+
+      <!-- User field (Only for Personal) -->
+      <div class="col-12 col-sm-3" id="field-user-container">
+        <label class="form-label" for="user_id">Пользователь</label>
+        <div class="input-group">
+          <input class="form-control rounded-3" id="user_id" name="user_id" placeholder="ID или @username" required />
+        </div>
+      </div>
+
+      <div class="col-12 col-sm-3">
+        <label class="form-label" for="host_name">Хост</label>
+        <div class="soft-select" id="host_softselect" data-target="host_name">
+          <button type="button" class="soft-select-toggle" id="host_name_toggle">Выберите хост...</button>
+          <div class="soft-select-menu" id="host_name_menu"></div>
+          <select class="form-select rounded-3 select-soft" id="host_name" name="host_name" required>
+            <option value="" selected disabled>Выберите хост...</option>
+            {% for h in hosts %}
+            <option value="{{ h.host_name }}" data-inbound="{{ h.inbound }}">{{ h.host_name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+      <div class="col-12 col-sm-2">
+        <label class="form-label" for="inbound_id">Inbound ID</label>
+        <input class="form-control rounded-3" type="text" id="inbound_id" placeholder="—" readonly />
+      </div>
+      <div class="col-12 col-sm-4" id="field-email-container">
+        <label class="form-label" for="key_email">Email ключа</label>
+        <input class="form-control rounded-3" type="email" id="key_email" name="key_email" placeholder="user@bot.local" required readonly />
+      </div>
+      <div class="col-12 col-sm-4">
+        <label class="form-label" for="plan_select">Тариф</label>
+        <div class="input-group">
+          <div class="soft-select flex-grow-1" id="plan_softselect" data-target="plan_select">
+            <button type="button" class="soft-select-toggle" id="plan_select_toggle">— Не выбран —</button>
+            <div class="soft-select-menu" id="plan_select_menu"></div>
+            <select class="form-select rounded-3 select-soft" id="plan_select">
+              <option value="">— Не выбран —</option>
+            </select>
+          </div>
+          <span class="input-group-text rounded-3 fw-semibold text-white bg-purple" id="plan_price" style="border:0;">— RUB</span>
+        </div>
+      </div>
+      <div class="col-12 col-sm-2">
+        <label class="form-label" for="custom_days">Дней</label>
+        <input class="form-control rounded-3" type="number" id="custom_days" min="1" placeholder="например, 30" />
+      </div>
+      <div class="col-12 col-sm-4">
+        <label class="form-label" for="expiry_date">Истекает</label>
+        <div class="d-flex flex-wrap align-items-stretch gap-2 gp-presets">
+          <input class="form-control rounded-3 expiry-input" type="text" id="expiry_date" name="expiry_date" placeholder="Выберите дату" />
+          <button class="btn btn-outline-secondary rounded-3" type="button" data-preset="30">+30</button>
+          <button class="btn btn-outline-secondary rounded-3" type="button" data-preset="90">+90</button>
+          <button class="btn btn-outline-secondary rounded-3" type="button" data-preset="180">+180</button>
+          <button class="btn btn-outline-secondary rounded-3" type="button" data-preset="365">+365</button>
+        </div>
+      </div>
+      <div class="col-12 col-sm-12">
+        <button type="button" class="btn btn-primary rounded-3" id="btn-submit-create">Создать ключ</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-body">
+    <div class="table-responsive">
+      <table class="table table-vcenter">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>User</th>
+            <th>Хост</th>
+            <th>Email</th>
+            <th>UUID</th>
+            <th>Истекает</th>
+            <th>Создан</th>
+            <th class="w-1">Действия</th>
+          </tr>
+        </thead>
+        <tbody id="keys-tbody" data-fetch-url="{{ url_for('admin_keys_table_partial') }}" data-fetch-interval="10000">
+          {% for k in keys %}
+          <tr>
+            <td>#{{ k.key_id }}</td>
+            <td>{{ k.user_id }}</td>
+            <td>{{ k.host_name }}</td>
+            <td>{{ k.key_email }}</td>
+            <td class="text-truncate" style="max-width:180px">{{ k.xui_client_uuid }}</td>
+            <td>{{ k.expiry_date or '' }}</td>
+            <td>{{ k.created_date or '' }}</td>
+            <td>
+              <div class="btn-list">
+                <form action="{{ url_for('delete_key_route', key_id=k.key_id) }}" method="post" data-confirm="Удалить ключ #{{ k.key_id }}?">
+                  <button type="submit" class="btn btn-danger btn-sm">Удалить</button>
+                </form>
+              </div>
+            </td>
+          </tr>
+          <tr>
+            <td colspan="8">
+              <form class="row g-2 align-items-center" action="{{ url_for('update_key_comment_route', key_id=k.key_id) }}" method="post">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+                <div class="col-12 col-md-10">
+                  <input class="form-control rounded-pill" type="text" name="comment" value="{{ k.comment or '' }}" placeholder="Комментарий" />
+                </div>
+                <div class="col-12 col-md-2">
+                  <button class="btn btn-outline-secondary rounded-pill w-100">Сохранить комментарий</button>
+                </div>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- удалён дублирующийся скрипт, логика перенесена ниже в общий IIFE -->
+
+<!-- Toasts для статуса AJAX -->
+<div class="position-fixed bottom-0 end-0 p-3" style="z-index:9999">
+  <div id="toastOk" class="toast align-items-center text-bg-success border-0" role="alert" aria-live="assertive" aria-atomic="true">
+    <div class="d-flex">
+      <div class="toast-body">Ключ выдан и отправлен пользователю.</div>
+      <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
+    </div>
+  </div>
+  <div id="toastErr" class="toast align-items-center text-bg-danger border-0 mt-2" role="alert" aria-live="assertive" aria-atomic="true">
+    <div class="d-flex">
+      <div class="toast-body">Ошибка при выдаче ключа. Проверьте данные и доступность XUI.</div>
+      <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
+    </div>
+  </div>
+</div>
+
+<script>
+  (function(){
+    // --- Mode Switching Logic ---
+    const modeInputs = document.querySelectorAll('input[name="mode_switch"]');
+    const formModeInput = document.getElementById('form_mode');
+    const userContainer = document.getElementById('field-user-container');
+    const emailContainer = document.getElementById('field-email-container');
+    const userField = document.getElementById('user_id');
+    const emailField = document.getElementById('key_email');
+
+    function updateMode() {
+      const mode = document.querySelector('input[name="mode_switch"]:checked').value;
+      if (formModeInput) formModeInput.value = mode;
+
+      if (mode === 'gift') {
+        // Hide User field, disable requirement
+        if (userContainer) userContainer.style.display = 'none';
+        if (userField) userField.required = false;
+        
+        // Hide Email field (auto-generated by backend)
+        if (emailContainer) emailContainer.style.display = 'none';
+        if (emailField) emailField.required = false;
+      } else {
+        // Show User field
+        if (userContainer) userContainer.style.display = 'block';
+        if (userField) userField.required = true;
+
+        // Show Email field
+        if (emailContainer) emailContainer.style.display = 'block';
+        if (emailField) emailField.required = true;
+      }
+    }
+
+    modeInputs.forEach(inp => inp.addEventListener('change', updateMode));
+    // Initial call
+    updateMode();
+
+    // Полный список пользователей -> построим карту @username -> telegram_id на клиенте
+    const USERS = JSON.parse(String.raw`{{ users | tojson | safe }}`);
+    const USER_MAP = {};
+    try {
+      (USERS || []).forEach(u => {
+        if (u && u.username) {
+          USER_MAP['@' + String(u.username).toLowerCase()] = u.telegram_id;
+        }
+      });
+    } catch(_) {}
+
+    const form = document.getElementById('create-key-form');
+    const submitBtn = document.getElementById('btn-submit-create');
+    if (!form || !submitBtn) return;
+
+    // Блокируем Enter, чтобы браузер не сабмитил форму нативно
+    form.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); }
+    });
+
+    // Сохранение полей в localStorage
+    const fields = ['user_id','host_name','key_email','plan_select','custom_days','expiry_date'];
+    function saveState(){
+      const state = {};
+      fields.forEach(id => { const el = document.getElementById(id); if (el) state[id] = el.value; });
+      try { localStorage.setItem('admin_keys_form', JSON.stringify(state)); } catch(_){ }
+    }
+    function restoreState(){
+      try {
+        const raw = localStorage.getItem('admin_keys_form');
+        if (!raw) return;
+        const st = JSON.parse(raw);
+        fields.forEach(id => { const el = document.getElementById(id); if (el && st[id] != null) el.value = st[id]; });
+      } catch(_){ }
+    }
+    restoreState();
+    form.addEventListener('input', saveState);
+    form.addEventListener('change', saveState);
+
+    // Префил из query ?user_id=
+    try {
+      const params = new URLSearchParams(location.search);
+      const uid = params.get('user_id');
+      if (uid) {
+        const el = document.getElementById('user_id');
+        if (el) el.value = uid;
+      }
+    } catch(_) {}
+
+    // После восстановления — если есть выбранный хост, сразу отобразить inbound и загрузить тарифы
+    const hostSel = document.getElementById('host_name');
+    const inboundEl = document.getElementById('inbound_id');
+    const planSel = document.getElementById('plan_select');
+    const priceEl = document.getElementById('plan_price');
+    const expiryInput = document.getElementById('expiry_date');
+    const daysInput = document.getElementById('custom_days');
+    const emailInput = document.getElementById('key_email');
+    const userInput = document.getElementById('user_id');
+
+    // Утилита для ручного обновления контейнера с data-fetch-url (без перезагрузки страницы)
+    async function refreshContainerById(id){
+      try{
+        const el = document.getElementById(id);
+        if (!el) return;
+        const url = el.getAttribute('data-fetch-url');
+        if (!url) return;
+        const resp = await fetch(url, { headers: { 'Accept': 'text/html' }, cache: 'no-store', credentials: 'same-origin' });
+        if (!resp.ok) return;
+        const html = await resp.text();
+        if (html && html !== el.innerHTML) { el.innerHTML = html; }
+      }catch(_){ }
+    }
+
+    // ---- Soft Select helpers ----
+    function buildSoftSelect(selectEl, toggleEl, menuEl, placeholder){
+      if (!selectEl || !toggleEl || !menuEl) return;
+      // Render items
+      menuEl.innerHTML = '';
+      const opts = Array.from(selectEl.options || []);
+      opts.forEach(opt => {
+        const div = document.createElement('div');
+        div.className = 'soft-select-item' + (opt.selected ? ' is-active' : '');
+        div.dataset.value = opt.value;
+        div.textContent = opt.textContent || '';
+        div.addEventListener('click', () => {
+          selectEl.value = opt.value;
+          // Update active visuals
+          menuEl.querySelectorAll('.soft-select-item').forEach(el => el.classList.remove('is-active'));
+          div.classList.add('is-active');
+          // Update toggle text
+          toggleEl.textContent = opt.textContent || placeholder || '';
+          // Close
+          toggleEl.closest('.soft-select')?.classList.remove('open');
+          // Fire native change for existing logic
+          selectEl.dispatchEvent(new Event('change', { bubbles: true }));
+          // Если это хост — сразу обновим inbound
+          if (selectEl.id === 'host_name') { try { updateInbound(); } catch(_){} }
+        });
+        menuEl.appendChild(div);
+      });
+      // Set initial toggle text
+      const selOpt = opts.find(o => o.selected) || opts[0];
+      toggleEl.textContent = (selOpt && selOpt.textContent) || placeholder || '';
+      // Toggle open/close (меню переносим в body и позиционируем фиксировано)
+      const wrap = toggleEl.closest('.soft-select');
+      function placeMenu() {
+        const r = toggleEl.getBoundingClientRect();
+        menuEl.style.position = 'fixed';
+        menuEl.style.left = `${Math.round(r.left)}px`;
+        menuEl.style.top = `${Math.round(r.bottom + 6)}px`;
+        menuEl.style.width = `${Math.round(r.width)}px`;
+        menuEl.style.zIndex = '1065';
+      }
+      function openMenu(){
+        if (menuEl.parentElement !== document.body) {
+          document.body.appendChild(menuEl);
+        }
+        placeMenu();
+        wrap.classList.add('open');
+        menuEl.style.display = 'block';
+        window.addEventListener('scroll', placeMenu, true);
+        window.addEventListener('resize', placeMenu, true);
+      }
+      function closeMenu(){
+        wrap.classList.remove('open');
+        menuEl.style.display = 'none';
+        // Вернём меню обратно в обёртку, чтобы не терять контекст
+        if (menuEl.parentElement === document.body) {
+          wrap.appendChild(menuEl);
+        }
+        window.removeEventListener('scroll', placeMenu, true);
+        window.removeEventListener('resize', placeMenu, true);
+      }
+      toggleEl.onclick = (e) => {
+        e.stopPropagation();
+        if (wrap.classList.contains('open')) closeMenu(); else openMenu();
+      };
+      document.addEventListener('click', (e) => {
+        if (!wrap.contains(e.target)) closeMenu();
+      });
+    }
+    function initSoftSelect(selectId, placeholder){
+      const sel = document.getElementById(selectId);
+      const wrap = document.querySelector(`.soft-select[data-target="${selectId}"]`);
+      if (!sel || !wrap) return;
+      const toggle = wrap.querySelector('.soft-select-toggle');
+      const menu = wrap.querySelector('.soft-select-menu');
+      buildSoftSelect(sel, toggle, menu, placeholder);
+      // Sync when value changes externally
+      sel.addEventListener('change', () => buildSoftSelect(sel, toggle, menu, placeholder));
+      // При инициализации: если это хост — проставим inbound сразу
+      if (selectId === 'host_name') { try { updateInbound(); } catch(_){} }
+      // Esc для закрытия
+      document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { const w = toggle.closest('.soft-select'); if (w?.classList.contains('open')) w.classList.remove('open'); menu.style.display='none'; }});
+    }
+    function refreshSoftSelect(selectId, placeholder){
+      const sel = document.getElementById(selectId);
+      const wrap = document.querySelector(`.soft-select[data-target="${selectId}"]`);
+      if (!sel || !wrap) return;
+      const toggle = wrap.querySelector('.soft-select-toggle');
+      const menu = wrap.querySelector('.soft-select-menu');
+      buildSoftSelect(sel, toggle, menu, placeholder);
+      if (selectId === 'host_name') { try { updateInbound(); } catch(_){} }
+    }
+
+    function setExpiryDays(days){
+      if (!expiryInput) return;
+      const d = new Date();
+      d.setDate(d.getDate() + Number(days || 0));
+      const pad = n => String(n).padStart(2,'0');
+      const val = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+      expiryInput.value = val;
+      if (window.flatpickr && expiryInput._flatpickr) {
+        expiryInput._flatpickr.setDate(val, true, 'Y-m-d H:i');
+      }
+    }
+
+    function updateInbound() {
+      if (!hostSel || !inboundEl) return;
+      let opt = hostSel.options[hostSel.selectedIndex];
+      if ((!opt || !opt.getAttribute) && hostSel.value) {
+        // Поищем option по value вручную
+        opt = Array.from(hostSel.options || []).find(o => String(o.value) === String(hostSel.value));
+      }
+      inboundEl.value = (opt && opt.getAttribute('data-inbound')) ? opt.getAttribute('data-inbound') : '—';
+    }
+    async function loadPlansAndRestore() {
+      if (!hostSel || !planSel) return;
+      const host = hostSel.value;
+      if (!host) { planSel.innerHTML = '<option value="">— Не выбран —</option>'; planSel.disabled = true; return; }
+      planSel.disabled = true;
+      planSel.innerHTML = '<option value="">Загрузка...</option>';
+      try {
+        const res = await fetch(`{{ url_for('admin_get_plans_for_host_json', host_name='__HOST__') }}`.replace('__HOST__', encodeURIComponent(host)));
+        const d = await res.json();
+        const items = (d && d.ok && d.items) ? d.items : [];
+        const saved = (JSON.parse(localStorage.getItem('admin_keys_form')||'{}')||{}).plan_select;
+        planSel.innerHTML = '<option value="">— Не выбран —</option>' + items.map(p => `<option value="${p.months}" data-price="${p.price||0}">${p.plan_name} (${p.months} мес.) — ${Number(p.price||0).toFixed(0)} RUB</option>`).join('');
+        planSel.disabled = false;
+        // восстановим выбранный тариф, если есть
+        if (saved) {
+          planSel.value = saved;
+          const opt = planSel.options[planSel.selectedIndex];
+          const price = opt ? Number(opt.getAttribute('data-price')||0) : 0;
+          if (priceEl) priceEl.textContent = saved ? `${price.toFixed(0)} RUB` : '— RUB';
+          const months = Number(saved || 0);
+          if (months > 0) setExpiryDays(months * 30);
+        } else if (priceEl) { priceEl.textContent = '— RUB'; }
+        // обновим мягкий селектор тарифа
+        refreshSoftSelect('plan_select', '— Не выбран —');
+      } catch(_) {
+        planSel.innerHTML = '<option value="">— Не выбран —</option>';
+        planSel.disabled = false;
+        if (priceEl) priceEl.textContent = '— RUB';
+      }
+    }
+    // Инициализация после восстановления
+    if (hostSel && hostSel.value) {
+      try { updateInbound(); } catch(_){}
+      loadPlansAndRestore();
+    }
+    // Инициализируем soft-select-обёртки
+    initSoftSelect('host_name', 'Выберите хост...');
+    initSoftSelect('plan_select', '— Не выбран —');
+
+    // ---- Подсказки для пользователя (ID / @username) ----
+    function initUserSuggest(){
+      const input = document.getElementById('user_id');
+      if (!input) return;
+      let menu = document.createElement('div');
+      menu.className = 'soft-select-menu';
+      menu.style.position = 'fixed';
+      menu.style.display = 'none';
+      document.body.appendChild(menu);
+
+      function place(){
+        const r = input.getBoundingClientRect();
+        menu.style.left = `${Math.round(r.left)}px`;
+        menu.style.top = `${Math.round(r.bottom + 6)}px`;
+        menu.style.width = `${Math.round(r.width)}px`;
+        menu.style.zIndex = '1065';
+      }
+      function close(){ menu.style.display='none'; }
+      function open(){ place(); menu.style.display='block'; }
+
+      function render(list){
+        menu.innerHTML='';
+        list.slice(0, 8).forEach(u => {
+          const item = document.createElement('div');
+          item.className='soft-select-item';
+          const username = u.username ? '@'+String(u.username) : '—';
+          item.innerHTML = `<div style="font-weight:600">${u.telegram_id}</div><div style="opacity:.75">${username}</div>`;
+          item.onclick = async ()=>{
+            input.value = String(u.telegram_id);
+            close();
+            try { await normalizeUserId(); await maybeGenEmail(); } catch(_){ }
+          };
+          menu.appendChild(item);
+        });
+        if (list.length===0){
+          const none=document.createElement('div');
+          none.className='soft-select-item';
+          none.style.opacity='.7';
+          none.textContent='Ничего не найдено';
+          menu.appendChild(none);
+        }
+      }
+
+      function applyFilter(){
+        const q = String(input.value||'').trim().toLowerCase();
+        if (!q){ close(); return; }
+        const arr = (USERS||[]).filter(u=>{
+          const idm = String(u.telegram_id||'').includes(q);
+          const unm = (u.username?('@'+String(u.username).toLowerCase()):'').includes(q);
+          return idm || unm;
+        });
+        render(arr);
+        open();
+      }
+
+      input.addEventListener('focus', ()=>{ applyFilter(); });
+      input.addEventListener('input', ()=>{ applyFilter(); });
+      window.addEventListener('scroll', place, true);
+      window.addEventListener('resize', place, true);
+      document.addEventListener('click', (e)=>{ if (!menu.contains(e.target) && e.target!==input) close(); });
+      document.addEventListener('keydown', (e)=>{ if (e.key==='Escape') close(); });
+    }
+    initUserSuggest();
+
+    // Нормализация user_id: если введён @username — конвертировать в telegram_id
+    async function normalizeUserId(){
+      if (!userInput) return;
+      const raw = String(userInput.value||'').trim();
+      if (!raw) return;
+      if (!/^[0-9]+$/.test(raw)) {
+        const key = raw.startsWith('@') ? raw.toLowerCase() : ('@'+raw.toLowerCase());
+        if (USER_MAP[key]) {
+          userInput.value = String(USER_MAP[key]);
+          try { localStorage.setItem('admin_keys_form', JSON.stringify({ ...JSON.parse(localStorage.getItem('admin_keys_form')||'{}'), user_id: userInput.value })); } catch(_){ }
+        }
+      }
+    }
+
+    // Автогенерация email
+    async function maybeGenEmail(){
+      if (!emailInput || !userInput) return;
+      const userId = userInput.value && String(userInput.value).trim();
+      if (!userId) return;
+      try {
+        const res = await fetch(`{{ url_for('generate_key_email_route') }}?user_id=${encodeURIComponent(userId)}`);
+        const data = await res.json();
+        if (data && data.ok && data.email) { emailInput.value = data.email; }
+      } catch(_) {}
+    }
+    if (userInput) {
+      userInput.addEventListener('blur', async ()=>{ await normalizeUserId(); await maybeGenEmail(); });
+      userInput.addEventListener('change', async ()=>{ await normalizeUserId(); await maybeGenEmail(); });
+      // генерация при загрузке
+      (async ()=>{ await normalizeUserId(); await maybeGenEmail(); })();
+    }
+
+    // Обработчики для тарифов/дней/пресетов
+    if (planSel) {
+      planSel.addEventListener('change', () => {
+        const months = Number(planSel.value || 0);
+        if (months > 0) setExpiryDays(months * 30);
+        const opt = planSel.options[planSel.selectedIndex];
+        const price = opt ? Number(opt.getAttribute('data-price')||0) : 0;
+        if (priceEl) priceEl.textContent = `${price.toFixed(0)} RUB`;
+      });
+    }
+    if (daysInput) {
+      daysInput.addEventListener('input', () => {
+        const days = Number(daysInput.value || 0);
+        if (days > 0) setExpiryDays(days);
+      });
+    }
+    document.querySelectorAll('[data-preset]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const add = Number(btn.getAttribute('data-preset')) || 0;
+        if (add > 0) setExpiryDays(add);
+      });
+    });
+
+    // Обновление inbound и загрузка тарифов по изменению хоста
+    if (hostSel && inboundEl) {
+      hostSel.addEventListener('change', () => {
+        updateInbound();
+        loadPlansAndRestore();
+      });
+    }
+
+    async function doSubmit(){
+      // Обновим email перед сабмитом, чтобы гарантированно был сгенерирован под текущего пользователя
+      await (async ()=>{ try { await maybeGenEmail(); } catch(_){} })();
+      submitBtn.disabled = true; submitBtn.textContent = 'Создаю...';
+      try {
+        const fd = new FormData(form);
+        const res = await fetch(form.action, { method: 'POST', body: fd, credentials: 'same-origin' });
+        const data = await res.json().catch(()=>({ok:false}));
+        if (data && data.ok) {
+          try { window.showToast('success', 'Ключ создан'); } catch(_){ }
+          // Динамически добавим строку в таблицу ключей без перезагрузки
+          try {
+            const tbody = document.querySelector('table.table tbody');
+            if (tbody) {
+              const uid = String(document.getElementById('user_id')?.value||'');
+              const host = String(document.getElementById('host_name')?.value||'');
+              const email = String(document.getElementById('key_email')?.value||'');
+              const uuid = String(data.uuid || '');
+              const expMs = Number(data.expiry_ms||0);
+              const dt = expMs ? new Date(expMs) : null;
+              const two = n => String(n).padStart(2,'0');
+              const expStr = dt ? `${dt.getFullYear()}-${two(dt.getMonth()+1)}-${two(dt.getDate())} ${two(dt.getHours())}:${two(dt.getMinutes())}` : '';
+              const now = new Date();
+              const createdStr = `${now.getFullYear()}-${two(now.getMonth()+1)}-${two(now.getDate())} ${two(now.getHours())}:${two(now.getMinutes())}`;
+              const tr = document.createElement('tr');
+              tr.innerHTML = `
+                <td>#${data.key_id||''}</td>
+                <td>${uid}</td>
+                <td>${host}</td>
+                <td>${email}</td>
+                <td class="text-truncate" style="max-width:180px">${uuid}</td>
+                <td>${expStr}</td>
+                <td>${createdStr}</td>
+                <td><span class="text-secondary">—</span></td>
+              `;
+              tbody.prepend(tr);
+            }
+          } catch(_){}
+          // Также сразу подтянем серверный partial, чтобы таблица была в актуальном состоянии
+          try { await refreshContainerById('keys-tbody'); } catch(_){ }
+        } else {
+          try { window.showToast('danger', 'Не удалось создать ключ'); } catch(_){ }
+        }
+      } catch (err) {
+        try { window.showToast('danger', 'Ошибка при создании ключа'); } catch(_){ }
+      } finally {
+        submitBtn.disabled = false; submitBtn.textContent = 'Создать ключ';
+      }
+    }
+
+    submitBtn.addEventListener('click', doSubmit);
+  })();
+</script>
+
+<!-- Панель массовых действий над ключами -->
+<div id="expired-toolbar" class="d-flex justify-content-end align-items-center my-2 gap-2">
+  <form action="{{ url_for('sweep_expired_keys_route') }}" method="post" data-confirm="Удалить все истёкшие ключи? Это действие необратимо.">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+    <button type="submit" class="btn btn-outline-danger btn-sm btn-glass" title="Удалить истёкшие" data-bs-toggle="tooltip">
+      <i class="ti ti-broom"></i> Удалить истёкшие
+    </button>
+  </form>
+  </div>
+
+<script>
+  // Перенести панель удаления истёкших над таблицей ключей
+  (function(){
+    const toolbar = document.getElementById('expired-toolbar');
+    const tbody = document.getElementById('keys-tbody');
+    if (toolbar && tbody) {
+      const table = tbody.closest('table');
+      if (table && table.parentElement) {
+        table.parentElement.insertBefore(toolbar, table);
+      }
+    }
+  })();
+</script>
+
+<!-- Modal: Сменить срок действия ключа -->
+<div class="modal modal-blur fade" id="expiryModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Изменить срок действия</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <label for="expiryDelta" class="form-label">Сколько дней прибавить/убавить</label>
+        <input type="number" class="form-control" id="expiryDelta" placeholder="Например, 7 или -7" />
+        <small class="text-secondary">Введите положительное число для продления, отрицательное — для уменьшения срока.</small>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Отмена</button>
+        <button type="button" class="btn btn-primary" id="expirySaveBtn">Сохранить</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  // Обработчик модалки изменения срока действия
+  (function(){
+    function getCsrf(){
+      const m = document.querySelector('meta[name="csrf-token"]');
+      return m ? m.getAttribute('content') : '';
+    }
+    const modalEl = document.getElementById('expiryModal');
+    const inputEl = document.getElementById('expiryDelta');
+    const saveBtn = document.getElementById('expirySaveBtn');
+    let currentKeyId = null;
+
+    document.addEventListener('click', (e)=>{
+      const btn = e.target.closest('.btn-open-expiry');
+      if (!btn) return;
+      currentKeyId = btn.getAttribute('data-key-id');
+      inputEl.value = '';
+      try { new bootstrap.Modal(modalEl).show(); } catch(_){ }
+    });
+
+    async function doSave(){
+      const val = String(inputEl.value||'').trim();
+      if (!currentKeyId || !val) { try { window.showToast('warning', 'Введите количество дней'); } catch(_){ } return; }
+      const delta = Number(val);
+      if (!Number.isFinite(delta) || Math.abs(delta) > 3650) { try { window.showToast('warning', 'Некорректное значение'); } catch(_){ } return; }
+      const url = `{{ url_for('adjust_key_expiry_route', key_id=0) }}`.replace('/0/', `/${encodeURIComponent(currentKeyId)}/`);
+      const fd = new FormData();
+      fd.append('csrf_token', getCsrf());
+      fd.append('delta_days', String(delta));
+      saveBtn.disabled = true; saveBtn.textContent = 'Сохранение...';
+      try{
+        const resp = await fetch(url, { method: 'POST', body: fd, credentials: 'same-origin' });
+        if (resp.ok) {
+          // Try to update the expiry cell immediately for better UX
+          try {
+            const data = await resp.json().catch(()=>null);
+            const ms = data && data.new_expiry_ms ? Number(data.new_expiry_ms) : 0;
+            if (ms > 0) {
+              const dt = new Date(ms);
+              const two = n => String(n).padStart(2,'0');
+              const expStr = `${dt.getFullYear()}-${two(dt.getMonth()+1)}-${two(dt.getDate())} ${two(dt.getHours())}:${two(dt.getMinutes())}`;
+              const btn = document.querySelector(`.btn-open-expiry[data-key-id="${CSS.escape(String(currentKeyId))}"]`);
+              if (btn) {
+                const tr = btn.closest('tr');
+                if (tr) {
+                  // expiry cell is the 6th column (0-based index 5)
+                  const cell = tr.querySelectorAll('td')[5];
+                  if (cell) cell.textContent = expStr;
+                }
+              }
+            }
+          } catch(_){ }
+          try { bootstrap.Modal.getInstance(modalEl)?.hide(); } catch(_){ }
+          try { window.showToast('success', 'Срок обновлён'); } catch(_){ }
+          try { await refreshContainerById('keys-tbody'); } catch(_){ }
+        } else {
+          let msg = 'Не удалось обновить срок';
+          try { const data = await resp.json(); if (data && data.error) msg += `: ${data.error}`; } catch(_){}
+          try { window.showToast('danger', msg); } catch(_){ }
+        }
+      }catch(_){ try { window.showToast('danger', 'Ошибка сети'); } catch(__){} }
+      finally { saveBtn.disabled = false; saveBtn.textContent = 'Сохранить'; }
+    }
+    if (saveBtn) saveBtn.addEventListener('click', doSave);
+  })();
+</script>
+
+<!-- Modal: Комментарий к ключу -->
+<div class="modal modal-blur fade" id="commentModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Комментарий к ключу</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <input type="text" id="commentInput" class="form-control" placeholder="Введите комментарий" />
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Отмена</button>
+        <button type="button" class="btn btn-primary" id="commentSaveBtn">Сохранить</button>
+      </div>
+    </div>
+  </div>
+  </div>
+
+<script>
+  (function(){
+    const modalEl = document.getElementById('commentModal');
+    const inputEl = document.getElementById('commentInput');
+    const saveBtn = document.getElementById('commentSaveBtn');
+    let currentKeyId = null;
+
+    function getCsrf(){
+      const m = document.querySelector('meta[name="csrf-token"]');
+      return m ? m.getAttribute('content') : '';
+    }
+
+    document.addEventListener('click', (e)=>{
+      const btn = e.target.closest('.btn-edit-comment');
+      if (!btn) return;
+      currentKeyId = btn.getAttribute('data-key-id');
+      const cur = btn.getAttribute('data-current-comment') || '';
+      inputEl.value = cur;
+      try { new bootstrap.Modal(modalEl).show(); } catch(_){ }
+    });
+
+    async function saveComment(){
+      if (!currentKeyId) return;
+      const url = `{{ url_for('update_key_comment_route', key_id=0) }}`.replace('/0/', `/${encodeURIComponent(currentKeyId)}/`);
+      const fd = new FormData();
+      fd.append('csrf_token', getCsrf());
+      fd.append('comment', inputEl.value || '');
+      saveBtn.disabled = true; saveBtn.textContent = 'Сохранение...';
+      try {
+        const resp = await fetch(url, { method: 'POST', body: fd, credentials: 'same-origin' });
+        if (resp.ok) {
+          try { bootstrap.Modal.getInstance(modalEl)?.hide(); } catch(_){ }
+          try { await refreshContainerById('keys-tbody'); } catch(_){ }
+          try { window.showToast('success', 'Комментарий сохранён'); } catch(_){ }
+        } else {
+          let msg = 'Не удалось сохранить комментарий';
+          try { const data = await resp.json(); if (data && data.error) msg += `: ${data.error}`; } catch(_){}
+          try { window.showToast('danger', msg); } catch(_){ }
+        }
+      } catch (err) {
+        try { window.showToast('danger', 'Ошибка сети'); } catch(_){ }
+      } finally {
+        saveBtn.disabled = false; saveBtn.textContent = 'Сохранить';
+      }
+    }
+
+    if (saveBtn) saveBtn.addEventListener('click', saveComment);
+  })();
+</script>
+
+<!-- Flatpickr для красивого выбора даты/времени только на этой странице -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/themes/dark.css">
+<script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+<script src="https://cdn.jsdelivr.net/npm/flatpickr/dist/l10n/ru.js"></script>
+<script>
+  (function(){
+    const el = document.getElementById('expiry_date');
+    if (el && window.flatpickr) {
+      flatpickr(el, {
+        enableTime: true,
+        time_24hr: true,
+        dateFormat: 'Y-m-d H:i',
+        minuteIncrement: 5,
+        locale: flatpickr.l10ns.ru || 'ru',
+      });
+    }
+  })();
+</script>
+{% endblock %}
