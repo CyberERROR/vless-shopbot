@@ -11,15 +11,24 @@
 
 <div class="card glass mb-3">
   <div class="card-body">
-    <form action="{{ url_for('create_key_ajax_route') }}" method="post" class="row g-2 align-items-end" id="create-key-form" autocomplete="off">
+    <form action="{{ url_for('create_key_ajax_route') }}" method="post" class="row g-3" id="create-key-form" autocomplete="off">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
-      <div class="col-12 col-sm-3">
-        <label class="form-label" for="user_id">Пользователь</label>
-        <div class="input-group">
-          <input class="form-control rounded-3" id="user_id" name="user_id" placeholder="ID или @username" required />
+      <input type="hidden" name="mode" id="create_mode" value="personal" />
+      <div class="col-12">
+        <div class="btn-group" role="group" id="mode_switch">
+          <button type="button" class="btn btn-outline-primary active" data-mode="personal">Персональный ключ</button>
+          <button type="button" class="btn btn-outline-primary" data-mode="gift">Подарочный ключ</button>
         </div>
       </div>
-      <div class="col-12 col-sm-3">
+
+      <div class="mode-section mode-personal col-12 col-md-4">
+        <label class="form-label" for="user_id">Пользователь</label>
+        <div class="input-group">
+          <input class="form-control rounded-3" id="user_id" name="user_id" placeholder="ID или @username" />
+        </div>
+      </div>
+
+      <div class="col-12 col-md-4">
         <label class="form-label" for="host_name">Хост</label>
         <div class="soft-select" id="host_softselect" data-target="host_name">
           <button type="button" class="soft-select-toggle" id="host_name_toggle">Выберите хост...</button>
@@ -27,20 +36,23 @@
           <select class="form-select rounded-3 select-soft" id="host_name" name="host_name" required>
             <option value="" selected disabled>Выберите хост...</option>
             {% for h in hosts %}
-            <option value="{{ h.host_name }}" data-inbound="{{ h.inbound }}">{{ h.host_name }}</option>
+            <option value="{{ h.host_name }}" data-inbound="{{ h.host_inbound_id }}">{{ h.host_name }}</option>
             {% endfor %}
           </select>
         </div>
       </div>
-      <div class="col-12 col-sm-2">
+
+      <div class="col-12 col-md-2">
         <label class="form-label" for="inbound_id">Inbound ID</label>
         <input class="form-control rounded-3" type="text" id="inbound_id" placeholder="—" readonly />
       </div>
-      <div class="col-12 col-sm-4">
+
+      <div class="mode-section mode-personal col-12 col-md-4">
         <label class="form-label" for="key_email">Email ключа</label>
-        <input class="form-control rounded-3" type="email" id="key_email" name="key_email" placeholder="user@bot.local" required readonly />
+        <input class="form-control rounded-3" type="email" id="key_email" name="key_email" placeholder="user@bot.local" readonly />
       </div>
-      <div class="col-12 col-sm-4">
+
+      <div class="col-12 col-md-4">
         <label class="form-label" for="plan_select">Тариф</label>
         <div class="input-group">
           <div class="soft-select flex-grow-1" id="plan_softselect" data-target="plan_select">
@@ -53,11 +65,12 @@
           <span class="input-group-text rounded-3 fw-semibold text-white bg-purple" id="plan_price" style="border:0;">— RUB</span>
         </div>
       </div>
-      <div class="col-12 col-sm-2">
+      <div class="col-12 col-md-2">
         <label class="form-label" for="custom_days">Дней</label>
         <input class="form-control rounded-3" type="number" id="custom_days" min="1" placeholder="например, 30" />
       </div>
-      <div class="col-12 col-sm-4">
+
+      <div class="mode-section mode-personal col-12 col-md-4">
         <label class="form-label" for="expiry_date">Истекает</label>
         <div class="d-flex flex-wrap align-items-stretch gap-2 gp-presets">
           <input class="form-control rounded-3 expiry-input" type="text" id="expiry_date" name="expiry_date" placeholder="Выберите дату" />
@@ -67,8 +80,20 @@
           <button class="btn btn-outline-secondary rounded-3" type="button" data-preset="365">+365</button>
         </div>
       </div>
-      <div class="col-12 col-sm-12">
-        <button type="button" class="btn btn-primary rounded-3" id="btn-submit-create">Создать ключ</button>
+
+      <div class="mode-section mode-gift col-12 d-none">
+        <div class="alert alert-info rounded-3">
+          Будет создан <b>подарочный ключ</b> на выбранном хосте Remnawave. Email для ключа сгенерируется автоматически и отобразится после создания.
+        </div>
+      </div>
+
+      <div class="col-12">
+        <label class="form-label" for="comment">Комментарий</label>
+        <textarea class="form-control rounded-3" id="comment" name="comment" rows="2" placeholder="Необязательный комментарий"></textarea>
+      </div>
+
+      <div class="col-12">
+        <button type="button" class="btn btn-primary rounded-3" id="btn-submit-create">Создать</button>
       </div>
     </form>
   </div>
@@ -97,7 +122,7 @@
             <td>{{ k.user_id }}</td>
             <td>{{ k.host_name }}</td>
             <td>{{ k.key_email }}</td>
-            <td class="text-truncate" style="max-width:180px">{{ k.xui_client_uuid }}</td>
+            <td class="text-truncate" style="max-width:180px">{{ k.remnawave_user_uuid }}</td>
             <td>{{ k.expiry_date or '' }}</td>
             <td>{{ k.created_date or '' }}</td>
             <td>
@@ -128,9 +153,9 @@
   </div>
 </div>
 
-<!-- удалён дублирующийся скрипт, логика перенесена ниже в общий IIFE -->
 
-<!-- Toasts для статуса AJAX -->
+
+
 <div class="position-fixed bottom-0 end-0 p-3" style="z-index:9999">
   <div id="toastOk" class="toast align-items-center text-bg-success border-0" role="alert" aria-live="assertive" aria-atomic="true">
     <div class="d-flex">
@@ -140,7 +165,7 @@
   </div>
   <div id="toastErr" class="toast align-items-center text-bg-danger border-0 mt-2" role="alert" aria-live="assertive" aria-atomic="true">
     <div class="d-flex">
-      <div class="toast-body">Ошибка при выдаче ключа. Проверьте данные и доступность XUI.</div>
+      <div class="toast-body">Ошибка при выдаче ключа. Проверьте данные и доступность Remnawave.</div>
       <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
     </div>
   </div>
@@ -168,22 +193,30 @@
       if (e.key === 'Enter') { e.preventDefault(); }
     });
 
-    // Сохранение полей в localStorage
-    const fields = ['user_id','host_name','key_email','plan_select','custom_days','expiry_date'];
+    const STORAGE_KEY = 'admin_keys_form';
+    const stateFields = ['mode','user_id','host_name','key_email','plan_select','custom_days','expiry_date','token','activation_limit','token_expires','comment'];
     function saveState(){
       const state = {};
-      fields.forEach(id => { const el = document.getElementById(id); if (el) state[id] = el.value; });
-      try { localStorage.setItem('admin_keys_form', JSON.stringify(state)); } catch(_){ }
+      stateFields.forEach(name => {
+        const el = document.getElementById(name === 'mode' ? 'create_mode' : name);
+        if (el) state[name] = el.value;
+      });
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch(_){ }
     }
     function restoreState(){
+      let state = {};
       try {
-        const raw = localStorage.getItem('admin_keys_form');
-        if (!raw) return;
-        const st = JSON.parse(raw);
-        fields.forEach(id => { const el = document.getElementById(id); if (el && st[id] != null) el.value = st[id]; });
-      } catch(_){ }
+        state = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}') || {};
+      } catch(_){ state = {}; }
+      stateFields.forEach(name => {
+        const el = document.getElementById(name === 'mode' ? 'create_mode' : name);
+        if (el && state[name] != null) {
+          el.value = state[name];
+        }
+      });
+      return state;
     }
-    restoreState();
+    const restoredState = restoreState();
     form.addEventListener('input', saveState);
     form.addEventListener('change', saveState);
 
@@ -206,6 +239,10 @@
     const daysInput = document.getElementById('custom_days');
     const emailInput = document.getElementById('key_email');
     const userInput = document.getElementById('user_id');
+    const modeInput = document.getElementById('create_mode');
+    const tokenInput = document.getElementById('token');
+    const activationInput = document.getElementById('activation_limit');
+    const tokenExpiresInput = document.getElementById('token_expires');
 
     // Утилита для ручного обновления контейнера с data-fetch-url (без перезагрузки страницы)
     async function refreshContainerById(id){
@@ -345,7 +382,8 @@
         const d = await res.json();
         const items = (d && d.ok && d.items) ? d.items : [];
         const saved = (JSON.parse(localStorage.getItem('admin_keys_form')||'{}')||{}).plan_select;
-        planSel.innerHTML = '<option value="">— Не выбран —</option>' + items.map(p => `<option value="${p.months}" data-price="${p.price||0}">${p.plan_name} (${p.months} мес.) — ${Number(p.price||0).toFixed(0)} RUB</option>`).join('');
+        // Важно: value должен быть уникальным -> используем plan_id, а months/price кладём в data-атрибуты
+        planSel.innerHTML = '<option value="">— Не выбран —</option>' + items.map(p => `<option value="${p.plan_id}" data-months="${p.months}" data-price="${p.price||0}">${p.plan_name} (${p.months} мес.) — ${Number(p.price||0).toFixed(0)} RUB</option>`).join('');
         planSel.disabled = false;
         // восстановим выбранный тариф, если есть
         if (saved) {
@@ -353,7 +391,7 @@
           const opt = planSel.options[planSel.selectedIndex];
           const price = opt ? Number(opt.getAttribute('data-price')||0) : 0;
           if (priceEl) priceEl.textContent = saved ? `${price.toFixed(0)} RUB` : '— RUB';
-          const months = Number(saved || 0);
+          const months = opt ? Number(opt.getAttribute('data-months')||0) : 0;
           if (months > 0) setExpiryDays(months * 30);
         } else if (priceEl) { priceEl.textContent = '— RUB'; }
         // обновим мягкий селектор тарифа
@@ -472,9 +510,9 @@
     // Обработчики для тарифов/дней/пресетов
     if (planSel) {
       planSel.addEventListener('change', () => {
-        const months = Number(planSel.value || 0);
-        if (months > 0) setExpiryDays(months * 30);
         const opt = planSel.options[planSel.selectedIndex];
+        const months = opt ? Number(opt.getAttribute('data-months')||0) : 0;
+        if (months > 0) setExpiryDays(months * 30);
         const price = opt ? Number(opt.getAttribute('data-price')||0) : 0;
         if (priceEl) priceEl.textContent = `${price.toFixed(0)} RUB`;
       });
@@ -506,6 +544,8 @@
       submitBtn.disabled = true; submitBtn.textContent = 'Создаю...';
       try {
         const fd = new FormData(form);
+        // Вручную добавим текущий режим (input[type=hidden] может быть выключен при d-none)
+        if (modeInput) fd.set('mode', modeInput.value || 'personal');
         const res = await fetch(form.action, { method: 'POST', body: fd, credentials: 'same-origin' });
         const data = await res.json().catch(()=>({ok:false}));
         if (data && data.ok) {
@@ -514,9 +554,10 @@
           try {
             const tbody = document.querySelector('table.table tbody');
             if (tbody) {
-              const uid = String(document.getElementById('user_id')?.value||'');
+              const mode = String(document.getElementById('create_mode')?.value||'personal');
+              const uid = mode === 'gift' ? '—' : String(document.getElementById('user_id')?.value||'');
               const host = String(document.getElementById('host_name')?.value||'');
-              const email = String(document.getElementById('key_email')?.value||'');
+              const email = String((data && data.email) || document.getElementById('key_email')?.value || '');
               const uuid = String(data.uuid || '');
               const expMs = Number(data.expiry_ms||0);
               const dt = expMs ? new Date(expMs) : null;
@@ -546,15 +587,48 @@
       } catch (err) {
         try { window.showToast('danger', 'Ошибка при создании ключа'); } catch(_){ }
       } finally {
-        submitBtn.disabled = false; submitBtn.textContent = 'Создать ключ';
+        submitBtn.disabled = false; submitBtn.textContent = 'Создать';
       }
     }
+
+    // --- Переключение режимов (персональный / подарочный токен)
+    const modeSwitch = document.getElementById('mode_switch');
+    const modeSections = document.querySelectorAll('.mode-section');
+    function applyMode(mode){
+      if (modeInput) modeInput.value = mode;
+      modeSections.forEach(section => {
+        const isCurrent = section.classList.contains(`mode-${mode}`);
+        section.classList.toggle('d-none', !isCurrent);
+        section.querySelectorAll('input, textarea, select').forEach(input => {
+          if (!input.getAttribute('data-static-required')) {
+            input.required = isCurrent && input.dataset.required === 'true';
+          }
+        });
+      });
+      if (modeSwitch) {
+        modeSwitch.querySelectorAll('[data-mode]').forEach(btn => {
+          btn.classList.toggle('active', btn.getAttribute('data-mode') === mode);
+        });
+      }
+      // Персональный режим требует user_id, подарочный — нет
+      if (userInput) userInput.required = (mode === 'personal');
+      if (emailInput) emailInput.required = false;
+      saveState();
+    }
+    if (modeSwitch) {
+      modeSwitch.querySelectorAll('[data-mode]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          applyMode(btn.getAttribute('data-mode') || 'personal');
+        });
+      });
+    }
+    applyMode(restoredState.mode || (modeInput?.value || 'personal'));
 
     submitBtn.addEventListener('click', doSubmit);
   })();
 </script>
 
-<!-- Панель массовых действий над ключами -->
+
 <div id="expired-toolbar" class="d-flex justify-content-end align-items-center my-2 gap-2">
   <form action="{{ url_for('sweep_expired_keys_route') }}" method="post" data-confirm="Удалить все истёкшие ключи? Это действие необратимо.">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
@@ -578,7 +652,7 @@
   })();
 </script>
 
-<!-- Modal: Сменить срок действия ключа -->
+
 <div class="modal modal-blur fade" id="expiryModal" tabindex="-1" aria-hidden="true">
   <div class="modal-dialog">
     <div class="modal-content">
@@ -666,7 +740,7 @@
   })();
 </script>
 
-<!-- Modal: Комментарий к ключу -->
+
 <div class="modal modal-blur fade" id="commentModal" tabindex="-1" aria-hidden="true">
   <div class="modal-dialog">
     <div class="modal-content">
@@ -735,7 +809,7 @@
   })();
 </script>
 
-<!-- Flatpickr для красивого выбора даты/времени только на этой странице -->
+
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/themes/dark.css">
 <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
@@ -755,3 +829,5 @@
   })();
 </script>
 {% endblock %}
+
+

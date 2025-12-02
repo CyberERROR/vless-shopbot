@@ -4,7 +4,9 @@ import time
 import uuid
 import re
 import html as html_escape
-from datetime import datetime
+import hashlib
+import json
+from datetime import datetime, timedelta
 
 from aiogram import Bot, Router, F, types
 from aiogram.filters import Command, StateFilter
@@ -14,18 +16,16 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from shop_bot.bot import keyboards
 from shop_bot.data_manager import speedtest_runner
-from shop_bot.data_manager.database import (
+from shop_bot.data_manager import resource_monitor
+from shop_bot.data_manager import remnawave_repository as rw_repo
+from shop_bot.data_manager.remnawave_repository import (
     get_all_users,
     get_setting,
     get_user,
     get_keys_for_user,
-    get_key_by_id,
-    update_key_email,
-    update_key_host,
     create_gift_key,
-    add_new_key,
-    get_key_by_email,
     get_all_hosts,
+    get_all_ssh_targets,
     add_to_balance,
     deduct_from_balance,
     ban_user,
@@ -33,15 +33,22 @@ from shop_bot.data_manager.database import (
     delete_key_by_email,
     get_admin_stats,
     get_keys_for_host,
-    update_key_info,
     is_admin,
     get_referral_count,
     get_referral_balance_all,
     get_referrals_for_user,
+    create_promo_code,
+    list_promo_codes,
+    update_promo_code_status,
+)
+from shop_bot.data_manager.database import (
+    update_key_email,
+    set_referral_balance,
+    set_referral_balance_all,
 )
 from shop_bot.data_manager import backup_manager
 from shop_bot.bot.handlers import show_main_menu
-from shop_bot.modules.xui_api import create_or_update_key_on_host, delete_client_on_host
+from shop_bot.modules.remnawave_api import create_or_update_key_on_host, delete_client_on_host
 
 logger = logging.getLogger(__name__)
 
@@ -56,15 +63,15 @@ class Broadcast(StatesGroup):
 def get_admin_router() -> Router:
     admin_router = Router()
 
-    # Helper: форматирование упоминания пользователя (инициатора)
+
     def _format_user_mention(u: types.User) -> str:
         try:
             if u.username:
                 uname = u.username.lstrip('@')
                 return f"@{uname}"
-            # Fallback: кликабельная ссылка по ID с читаемым именем
+
             full_name = (u.full_name or u.first_name or "Администратор").strip()
-            # html_escape — это модуль, импортированный как html; у него есть .escape
+
             try:
                 safe_name = html_escape.escape(full_name)
             except Exception:
@@ -73,8 +80,28 @@ def get_admin_router() -> Router:
         except Exception:
             return str(getattr(u, 'id', '—'))
 
+
+    def _resolve_target_from_hash(cb_data: str) -> str | None:
+        try:
+            digest = cb_data.split(':', 1)[1]
+        except Exception:
+            return None
+        try:
+            targets = get_all_ssh_targets() or []
+        except Exception:
+            targets = []
+        for t in targets:
+            name = t.get('target_name')
+            try:
+                h = hashlib.sha1((name or '').encode('utf-8', 'ignore')).hexdigest()
+            except Exception:
+                h = hashlib.sha1(str(name).encode('utf-8', 'ignore')).hexdigest()
+            if h == digest:
+                return name
+        return None
+
     async def show_admin_menu(message: types.Message, edit_message: bool = False):
-        # Собираем статистику для отображения прямо в админ-меню
+
         stats = get_admin_stats() or {}
         today_new = stats.get('today_new_users', 0)
         today_income = float(stats.get('today_income', 0) or 0)
@@ -97,7 +124,12 @@ def get_admin_router() -> Router:
             "<b>Состояние ключей:</b>\n"
             f"✅ Активных: {active_keys}"
         )
-        keyboard = keyboards.create_admin_menu_keyboard()
+
+        try:
+            keyboard = keyboards.create_dynamic_admin_menu_keyboard()
+        except Exception as e:
+            logger.warning(f"Не удалось создать динамическую админ-клавиатуру, используем статическую: {e}")
+            keyboard = keyboards.create_admin_menu_keyboard()
         if edit_message:
             try:
                 await message.edit_text(text, reply_markup=keyboard)
@@ -105,6 +137,99 @@ def get_admin_router() -> Router:
                 pass
         else:
             await message.answer(text, reply_markup=keyboard)
+
+    async def show_admin_promo_menu(message: types.Message, edit_message: bool = False):
+        text = (
+            "🎟 <b>Управление промокодами</b>\n\n"
+            "Здесь можно создавать новые промокоды, просматривать список и отключать их."
+        )
+        keyboard = keyboards.create_admin_promo_menu_keyboard()
+        if edit_message:
+            try:
+                await message.edit_text(text, reply_markup=keyboard)
+            except Exception:
+                await message.answer(text, reply_markup=keyboard)
+        else:
+            await message.answer(text, reply_markup=keyboard)
+
+    def _parse_datetime_input(raw: str) -> datetime | None:
+        value = (raw or "").strip()
+        if not value or value.lower() in {"skip", "нет", "не", "none"}:
+            return None
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(value, fmt)
+            except Exception:
+                continue
+        raise ValueError("Неверный формат даты. Используйте 'ГГГГ-ММ-ДД' или 'ГГГГ-ММ-ДД ЧЧ:ММ'.")
+
+    def _format_promo_line(promo: dict) -> str:
+        code = promo.get("code") or "—"
+        discount_percent = promo.get("discount_percent")
+        discount_amount = promo.get("discount_amount")
+        try:
+            if discount_percent:
+                discount_text = f"{float(discount_percent):.2f}%"
+            else:
+                discount_text = f"{float(discount_amount or 0):.2f} RUB"
+        except Exception:
+            discount_text = str(discount_percent or discount_amount or "—")
+
+        status_parts: list[str] = []
+        is_active = bool(promo.get("is_active"))
+        status_parts.append("🟢 активен" if is_active else "🔴 отключён")
+
+        try:
+            usage_limit_total = int(promo.get("usage_limit_total") or 0)
+        except Exception:
+            usage_limit_total = 0
+        used_total = int(promo.get("used_total") or 0)
+        if usage_limit_total:
+            status_parts.append(f"{used_total}/{usage_limit_total}")
+            if used_total >= usage_limit_total:
+                status_parts.append("лимит исчерпан")
+
+        try:
+            usage_limit_per_user = int(promo.get("usage_limit_per_user") or 0)
+        except Exception:
+            usage_limit_per_user = 0
+        if usage_limit_per_user:
+            status_parts.append(f"пользователь ≤ {usage_limit_per_user}")
+
+        valid_until = promo.get("valid_until")
+        if valid_until:
+            status_parts.append(f"до {str(valid_until)[:16]}")
+
+        status_text = ", ".join(status_parts)
+        return f"• <code>{code}</code> — скидка: {discount_text} | статус: {status_text}"
+
+    def _build_promo_list_keyboard(codes: list[dict], page: int = 0, page_size: int = 10) -> types.InlineKeyboardMarkup:
+        builder = InlineKeyboardBuilder()
+        total = len(codes)
+        start = page * page_size
+        end = start + page_size
+        page_items = codes[start:end]
+        if not page_items:
+            builder.button(text="Промокодов нет", callback_data="noop")
+        for promo in page_items:
+            code = promo.get("code") or "—"
+            is_active = bool(promo.get("is_active"))
+            label = f"{'🟢' if is_active else '🔴'} {code}"
+            builder.button(text=label, callback_data=f"admin_promo_toggle_{code}")
+        have_prev = start > 0
+        have_next = end < total
+        if have_prev:
+            builder.button(text="⬅️ Назад", callback_data=f"admin_promo_page_{page-1}")
+        if have_next:
+            builder.button(text="Вперёд ➡️", callback_data=f"admin_promo_page_{page+1}")
+        builder.button(text="⬅️ В меню", callback_data="admin_promo_menu")
+        rows = [1] * len(page_items)
+        tail: list[int] = []
+        if have_prev or have_next:
+            tail.append(2 if (have_prev and have_next) else 1)
+        tail.append(1)
+        builder.adjust(*(rows + tail if rows else tail))
+        return builder.as_markup()
 
     @admin_router.callback_query(F.data == "admin_menu")
     async def open_admin_menu_handler(callback: types.CallbackQuery):
@@ -114,23 +239,586 @@ def get_admin_router() -> Router:
         await callback.answer()
         await show_admin_menu(callback.message, edit_message=True)
 
-    # --- Speedtest: кнопка в админ-меню -> выбор хоста ---
+
+    class AdminPromoCreate(StatesGroup):
+        waiting_for_code = State()
+        waiting_for_discount_type = State()
+        waiting_for_discount_value = State()
+        waiting_for_total_limit = State()
+        waiting_for_per_user_limit = State()
+        waiting_for_valid_from = State()
+        waiting_for_valid_until = State()
+        waiting_for_description = State()
+        confirming = State()
+
+    @admin_router.callback_query(F.data == "admin_promo_menu")
+    async def admin_promo_menu_handler(callback: types.CallbackQuery, state: FSMContext):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("У вас нет прав.", show_alert=True)
+            return
+        await callback.answer()
+        await state.clear()
+        await show_admin_promo_menu(callback.message, edit_message=True)
+
+    @admin_router.callback_query(F.data == "admin_promo_create")
+    async def admin_promo_create_start(callback: types.CallbackQuery, state: FSMContext):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("У вас нет прав.", show_alert=True)
+            return
+        await callback.answer()
+        await state.clear()
+        await state.set_state(AdminPromoCreate.waiting_for_code)
+        await callback.message.edit_text(
+            "🔐 Создание промокода\n\nВыберите способ указания кода:",
+            reply_markup=keyboards.create_admin_promo_code_keyboard()
+        )
+
+    @admin_router.callback_query(
+        AdminPromoCreate.waiting_for_code,
+        F.data == "admin_promo_code_auto"
+    )
+    async def admin_promo_code_auto(callback: types.CallbackQuery, state: FSMContext):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("У вас нет прав.", show_alert=True)
+            return
+        await callback.answer()
+        code = uuid.uuid4().hex[:8].upper()
+        await state.update_data(promo_code=code)
+        await state.set_state(AdminPromoCreate.waiting_for_discount_type)
+        try:
+            await callback.message.edit_text(
+                f"Код: <code>{code}</code>\n\nВыберите тип скидки:",
+                reply_markup=keyboards.create_admin_promo_discount_keyboard(),
+                parse_mode='HTML'
+            )
+        except Exception:
+            await callback.message.answer(
+                f"Код: <code>{code}</code>\n\nВыберите тип скидки:",
+                reply_markup=keyboards.create_admin_promo_discount_keyboard(),
+                parse_mode='HTML'
+            )
+
+    @admin_router.callback_query(
+        AdminPromoCreate.waiting_for_code,
+        F.data == "admin_promo_code_custom"
+    )
+    async def admin_promo_code_custom(callback: types.CallbackQuery):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("У вас нет прав.", show_alert=True)
+            return
+        await callback.answer()
+        await callback.message.edit_text(
+            "Введите желаемый код (только латиница/цифры) или напишите <b>авто</b> для генерации:",
+            reply_markup=keyboards.create_admin_cancel_keyboard(),
+            parse_mode='HTML'
+        )
+
+    @admin_router.message(AdminPromoCreate.waiting_for_code)
+    async def admin_promo_create_code(message: types.Message, state: FSMContext):
+        if not is_admin(message.from_user.id):
+            return
+        raw = (message.text or '').strip()
+        if not raw:
+            await message.answer("❌ Введите код или напишите 'авто'.")
+            return
+        code = uuid.uuid4().hex[:8].upper() if raw.lower() == 'авто' or raw.lower() == 'auto' else raw.strip().upper()
+        if not re.fullmatch(r"[A-Z0-9_-]{3,32}", code):
+            await message.answer("❌ Код должен состоять из латиницы/цифр и быть длиной 3-32 символа.")
+            return
+        await state.update_data(promo_code=code)
+        await state.set_state(AdminPromoCreate.waiting_for_discount_type)
+        await message.answer(
+            "Выберите тип скидки:",
+            reply_markup=keyboards.create_admin_promo_discount_keyboard()
+        )
+
+    @admin_router.callback_query(
+        AdminPromoCreate.waiting_for_discount_type,
+        F.data.in_({"admin_promo_discount_percent", "admin_promo_discount_amount"})
+    )
+    async def admin_promo_set_discount_type(callback: types.CallbackQuery, state: FSMContext):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("У вас нет прав.", show_alert=True)
+            return
+        await callback.answer()
+        discount_type = 'percent' if callback.data.endswith('percent') else 'amount'
+        await state.update_data(discount_type=discount_type)
+        await state.set_state(AdminPromoCreate.waiting_for_discount_value)
+        prompt = "Введите процент скидки (например, 10.5):" if discount_type == 'percent' else "Введите размер скидки в RUB (например, 150):"
+        await callback.message.edit_text(prompt, reply_markup=keyboards.create_admin_cancel_keyboard())
+
+    @admin_router.message(AdminPromoCreate.waiting_for_discount_value)
+    async def admin_promo_set_discount_value(message: types.Message, state: FSMContext):
+        if not is_admin(message.from_user.id):
+            return
+        data = await state.get_data()
+        discount_type = data.get('discount_type')
+        raw = (message.text or '').strip().replace(',', '.')
+        try:
+            value = float(raw)
+        except Exception:
+            await message.answer("❌ Введите число.")
+            return
+        if value <= 0:
+            await message.answer("❌ Значение должно быть положительным.")
+            return
+        if discount_type == 'percent' and value >= 100:
+            await message.answer("❌ Процент скидки должен быть меньше 100.")
+            return
+        await state.update_data(discount_value=value)
+        await state.set_state(AdminPromoCreate.waiting_for_total_limit)
+        await message.answer(
+            "Введите общий лимит активаций или выберите на кнопках:",
+            reply_markup=keyboards.create_admin_promo_limit_keyboard("total")
+        )
+
+    @admin_router.message(AdminPromoCreate.waiting_for_total_limit)
+    async def admin_promo_set_total_limit(message: types.Message, state: FSMContext):
+        if not is_admin(message.from_user.id):
+            return
+        raw = (message.text or '').strip().lower()
+        limit_total: int | None
+        if raw in {'0', '∞', 'inf', 'infinity', 'безлимит', 'нет'} or not raw:
+            limit_total = None
+        else:
+            try:
+                limit_total = int(raw)
+            except Exception:
+                await message.answer("❌ Введите целое число или 0 для безлимита.")
+                return
+            if limit_total <= 0:
+                limit_total = None
+        await state.update_data(usage_limit_total=limit_total)
+        await state.set_state(AdminPromoCreate.waiting_for_per_user_limit)
+        await message.answer(
+            "Введите лимит на пользователя или выберите на кнопках:",
+            reply_markup=keyboards.create_admin_promo_limit_keyboard("user")
+        )
+
+    @admin_router.callback_query(
+        AdminPromoCreate.waiting_for_total_limit,
+        F.data.startswith("admin_promo_limit_total_")
+    )
+    async def admin_promo_total_limit_buttons(callback: types.CallbackQuery, state: FSMContext):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("У вас нет прав.")
+            return
+        await callback.answer()
+        tail = callback.data.replace("admin_promo_limit_total_", "", 1)
+        if tail == "custom":
+            await callback.message.edit_text(
+                "Введите общий лимит активаций (целое число) или 0/∞ для безлимита:",
+                reply_markup=keyboards.create_admin_cancel_keyboard()
+            )
+            return
+        limit_total = None if tail == "inf" else int(tail)
+        await state.update_data(usage_limit_total=limit_total)
+        await state.set_state(AdminPromoCreate.waiting_for_per_user_limit)
+        await callback.message.edit_text(
+            "Введите лимит на пользователя или выберите на кнопках:",
+            reply_markup=keyboards.create_admin_promo_limit_keyboard("user")
+        )
+
+    @admin_router.callback_query(
+        AdminPromoCreate.waiting_for_per_user_limit,
+        F.data.startswith("admin_promo_limit_user_")
+    )
+    async def admin_promo_user_limit_buttons(callback: types.CallbackQuery, state: FSMContext):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("У вас нет прав.")
+            return
+        await callback.answer()
+        tail = callback.data.replace("admin_promo_limit_user_", "", 1)
+        if tail == "custom":
+            await callback.message.edit_text(
+                "Введите лимит на пользователя (целое число) или 0/∞ для безлимита:",
+                reply_markup=keyboards.create_admin_cancel_keyboard()
+            )
+            return
+        limit_user = None if tail == "inf" else int(tail)
+        await state.update_data(usage_limit_per_user=limit_user)
+        await state.set_state(AdminPromoCreate.waiting_for_valid_from)
+        await callback.message.edit_text(
+            "Укажите дату начала действия или выберите на кнопках:",
+            reply_markup=keyboards.create_admin_promo_valid_from_keyboard()
+        )
+
+    @admin_router.message(AdminPromoCreate.waiting_for_per_user_limit)
+    async def admin_promo_set_per_user_limit(message: types.Message, state: FSMContext):
+        if not is_admin(message.from_user.id):
+            return
+        raw = (message.text or '').strip().lower()
+        limit_user: int | None
+        if raw in {'0', '∞', 'inf', 'infinity', 'безлимит', 'нет'} or not raw:
+            limit_user = None
+        else:
+            try:
+                limit_user = int(raw)
+            except Exception:
+                await message.answer("❌ Введите целое число или 0 для безлимита.")
+                return
+            if limit_user <= 0:
+                limit_user = None
+        await state.update_data(usage_limit_per_user=limit_user)
+        await state.set_state(AdminPromoCreate.waiting_for_valid_from)
+        await message.answer(
+            "Укажите дату начала действия (ГГГГ-ММ-ДД или ГГГГ-ММ-ДД ЧЧ:ММ). Напишите 'skip', чтобы пропустить:",
+            reply_markup=keyboards.create_admin_cancel_keyboard()
+        )
+
+    @admin_router.message(AdminPromoCreate.waiting_for_valid_from)
+    async def admin_promo_set_valid_from(message: types.Message, state: FSMContext):
+        if not is_admin(message.from_user.id):
+            return
+        raw = (message.text or '').strip()
+        try:
+            valid_from = _parse_datetime_input(raw)
+        except ValueError as e:
+            await message.answer(f"❌ {e}")
+            return
+        await state.update_data(valid_from=valid_from)
+        await state.set_state(AdminPromoCreate.waiting_for_valid_until)
+        await message.answer(
+            "Укажите дату окончания действия или выберите на кнопках:",
+            reply_markup=keyboards.create_admin_promo_valid_until_keyboard()
+        )
+
+    @admin_router.callback_query(
+        AdminPromoCreate.waiting_for_valid_from,
+        F.data.in_({
+            "admin_promo_valid_from_now",
+            "admin_promo_valid_from_today",
+            "admin_promo_valid_from_tomorrow",
+            "admin_promo_valid_from_skip",
+            "admin_promo_valid_from_custom",
+        })
+    )
+    async def admin_promo_valid_from_buttons(callback: types.CallbackQuery, state: FSMContext):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("У вас нет прав.")
+            return
+        await callback.answer()
+        now = datetime.now()
+        if callback.data.endswith("custom"):
+            await callback.message.edit_text(
+                "Укажите дату начала (ГГГГ-ММ-ДД или ГГГГ-ММ-ДД ЧЧ:ММ):",
+                reply_markup=keyboards.create_admin_cancel_keyboard()
+            )
+            return
+        if callback.data.endswith("skip"):
+            valid_from = None
+        elif callback.data.endswith("today"):
+            valid_from = datetime(now.year, now.month, now.day)
+        elif callback.data.endswith("tomorrow"):
+            valid_from = datetime(now.year, now.month, now.day) + timedelta(days=1)
+        else:
+            valid_from = now
+        await state.update_data(valid_from=valid_from)
+        await state.set_state(AdminPromoCreate.waiting_for_valid_until)
+        await callback.message.edit_text(
+            "Укажите дату окончания действия или выберите на кнопках:",
+            reply_markup=keyboards.create_admin_promo_valid_until_keyboard()
+        )
+
+    @admin_router.message(AdminPromoCreate.waiting_for_valid_until)
+    async def admin_promo_set_valid_until(message: types.Message, state: FSMContext):
+        if not is_admin(message.from_user.id):
+            return
+        raw = (message.text or '').strip()
+        try:
+            valid_until = _parse_datetime_input(raw)
+        except ValueError as e:
+            await message.answer(f"❌ {e}")
+            return
+        data = await state.get_data()
+        valid_from = data.get('valid_from')
+        if valid_from and valid_until and valid_until <= valid_from:
+            await message.answer("❌ Дата окончания должна быть позже даты начала.")
+            return
+        await state.update_data(valid_until=valid_until)
+        await state.set_state(AdminPromoCreate.waiting_for_description)
+        await message.answer(
+            "Добавьте описание/комментарий или пропустите:",
+            reply_markup=keyboards.create_admin_promo_description_keyboard()
+        )
+
+    @admin_router.callback_query(
+        AdminPromoCreate.waiting_for_valid_until,
+        F.data.in_({
+            "admin_promo_valid_until_plus1d",
+            "admin_promo_valid_until_plus7d",
+            "admin_promo_valid_until_plus30d",
+            "admin_promo_valid_until_skip",
+            "admin_promo_valid_until_custom",
+        })
+    )
+    async def admin_promo_valid_until_buttons(callback: types.CallbackQuery, state: FSMContext):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("У вас нет прав.")
+            return
+        await callback.answer()
+        if callback.data.endswith("custom"):
+            await callback.message.edit_text(
+                "Укажите дату окончания (ГГГГ-ММ-ДД или ГГГГ-ММ-ДД ЧЧ:ММ):",
+                reply_markup=keyboards.create_admin_cancel_keyboard()
+            )
+            return
+        if callback.data.endswith("skip"):
+            valid_until = None
+        else:
+            data = await state.get_data()
+            base = data.get('valid_from') or datetime.now()
+            if callback.data.endswith("plus1d"):
+                valid_until = base + timedelta(days=1)
+            elif callback.data.endswith("plus7d"):
+                valid_until = base + timedelta(days=7)
+            else:
+                valid_until = base + timedelta(days=30)
+        await state.update_data(valid_until=valid_until)
+        await state.set_state(AdminPromoCreate.waiting_for_description)
+        await callback.message.edit_text(
+            "Добавьте описание/комментарий или пропустите:",
+            reply_markup=keyboards.create_admin_promo_description_keyboard()
+        )
+
+    @admin_router.message(AdminPromoCreate.waiting_for_description)
+    async def admin_promo_description(message: types.Message, state: FSMContext):
+        if not is_admin(message.from_user.id):
+            return
+        desc = (message.text or '').strip()
+        description = None if not desc or desc.lower() in {'skip', 'пропустить', 'нет'} else desc
+        await state.update_data(description=description)
+        data = await state.get_data()
+        code = data.get('promo_code')
+        discount_type = data.get('discount_type')
+        discount_value = data.get('discount_value')
+        total_limit = data.get('usage_limit_total')
+        per_user_limit = data.get('usage_limit_per_user')
+        valid_from = data.get('valid_from')
+        valid_until = data.get('valid_until')
+        summary_lines = [
+            "Проверьте данные промокода:",
+            f"Код: <code>{code}</code>",
+            f"Тип скидки: {'процент' if discount_type == 'percent' else 'фиксированная'}",
+            f"Значение: {discount_value:.2f}{'%' if discount_type == 'percent' else ' RUB'}",
+            f"Лимит всего: {total_limit if total_limit is not None else 'без ограничений'}",
+            f"Лимит на пользователя: {per_user_limit if per_user_limit is not None else 'без ограничений'}",
+            f"Действует с: {valid_from.isoformat(' ') if valid_from else '—'}",
+            f"Действует до: {valid_until.isoformat(' ') if valid_until else '—'}",
+            f"Описание: {description or '—'}",
+        ]
+        summary_text = "\n".join(summary_lines)
+        builder = InlineKeyboardBuilder()
+        builder.button(text="✅ Создать", callback_data="admin_promo_confirm")
+        builder.button(text="❌ Отмена", callback_data="admin_cancel")
+        builder.adjust(1, 1)
+        await state.set_state(AdminPromoCreate.confirming)
+        await message.answer(summary_text, reply_markup=builder.as_markup(), parse_mode='HTML')
+
+    @admin_router.callback_query(
+        AdminPromoCreate.waiting_for_description,
+        F.data.in_({"admin_promo_desc_skip", "admin_promo_desc_custom"})
+    )
+    async def admin_promo_desc_buttons(callback: types.CallbackQuery, state: FSMContext):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("У вас нет прав.")
+            return
+        await callback.answer()
+        if callback.data.endswith("custom"):
+            await callback.message.edit_text(
+                "Введите описание промокода (опционально) или нажмите Отмена:",
+                reply_markup=keyboards.create_admin_cancel_keyboard()
+            )
+            return
+
+        await state.update_data(description=None)
+        data = await state.get_data()
+        code = data.get('promo_code')
+        discount_type = data.get('discount_type')
+        discount_value = data.get('discount_value')
+        total_limit = data.get('usage_limit_total')
+        per_user_limit = data.get('usage_limit_per_user')
+        valid_from = data.get('valid_from')
+        valid_until = data.get('valid_until')
+        summary_lines = [
+            "Проверьте данные промокода:",
+            f"Код: <code>{code}</code>",
+            f"Тип скидки: {'процент' if discount_type == 'percent' else 'фиксированная'}",
+            f"Значение: {discount_value:.2f}{'%' if discount_type == 'percent' else ' RUB'}",
+            f"Лимит всего: {total_limit if total_limit is not None else 'без ограничений'}",
+            f"Лимит на пользователя: {per_user_limit if per_user_limit is not None else 'без ограничений'}",
+            f"Действует с: {valid_from.isoformat(' ') if valid_from else '—'}",
+            f"Действует до: {valid_until.isoformat(' ') if valid_until else '—'}",
+            f"Описание: —",
+        ]
+        summary_text = "\n".join(summary_lines)
+        builder = InlineKeyboardBuilder()
+        builder.button(text="✅ Создать", callback_data="admin_promo_confirm")
+        builder.button(text="❌ Отмена", callback_data="admin_cancel")
+        builder.adjust(1, 1)
+        await state.set_state(AdminPromoCreate.confirming)
+        await callback.message.edit_text(summary_text, reply_markup=builder.as_markup(), parse_mode='HTML')
+
+    @admin_router.callback_query(AdminPromoCreate.confirming, F.data == "admin_promo_confirm")
+    async def admin_promo_confirm(callback: types.CallbackQuery, state: FSMContext):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("У вас нет прав.", show_alert=True)
+            return
+        await callback.answer()
+        data = await state.get_data()
+        code = data.get('promo_code')
+        discount_type = data.get('discount_type')
+        discount_value = data.get('discount_value')
+        total_limit = data.get('usage_limit_total')
+        per_user_limit = data.get('usage_limit_per_user')
+        valid_from = data.get('valid_from')
+        valid_until = data.get('valid_until')
+        description = data.get('description')
+        kwargs = {
+            'code': code,
+            'discount_percent': discount_value if discount_type == 'percent' else None,
+            'discount_amount': discount_value if discount_type == 'amount' else None,
+            'usage_limit_total': total_limit,
+            'usage_limit_per_user': per_user_limit,
+            'valid_from': valid_from,
+            'valid_until': valid_until,
+            'created_by': callback.from_user.id,
+            'description': description,
+        }
+        try:
+            ok = create_promo_code(**kwargs)
+        except ValueError as e:
+            await callback.message.edit_text(f"❌ Не удалось создать промокод: {e}", reply_markup=keyboards.create_admin_promo_menu_keyboard())
+            await state.clear()
+            return
+        if not ok:
+            await callback.message.edit_text(
+                "❌ Не удалось создать промокод (возможно, код уже существует).",
+                reply_markup=keyboards.create_admin_promo_menu_keyboard()
+            )
+            await state.clear()
+            return
+        await state.clear()
+        await callback.message.edit_text(
+            f"✅ Промокод <code>{code}</code> создан!\n\nПередайте его пользователю или опубликуйте в канале.",
+            reply_markup=keyboards.create_admin_promo_menu_keyboard(),
+            parse_mode='HTML'
+        )
+
+    @admin_router.callback_query(F.data == "admin_promo_list")
+    async def admin_promo_list(callback: types.CallbackQuery, state: FSMContext):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("У вас нет прав.", show_alert=True)
+            return
+        await callback.answer()
+        await state.update_data(promo_page=0)
+        codes = list_promo_codes(include_inactive=True) or []
+        text_lines = ["🎟 <b>Доступные промокоды</b>"]
+        if not codes:
+            text_lines.append("Пока нет созданных промокодов.")
+        else:
+            for promo in codes[:10]:
+                text_lines.append(_format_promo_line(promo))
+        await callback.message.edit_text(
+            "\n".join(text_lines),
+            reply_markup=_build_promo_list_keyboard(codes, page=0),
+            parse_mode='HTML'
+        )
+
+    @admin_router.callback_query(F.data.startswith("admin_promo_page_"))
+    async def admin_promo_change_page(callback: types.CallbackQuery, state: FSMContext):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("У вас нет прав.")
+            return
+        await callback.answer()
+        try:
+            page = int(callback.data.split('_')[-1])
+        except Exception:
+            page = 0
+        codes = list_promo_codes(include_inactive=True) or []
+        await state.update_data(promo_page=page)
+        text_lines = ["🎟 <b>Доступные промокоды</b>"]
+        if not codes:
+            text_lines.append("Пока нет созданных промокодов.")
+        else:
+            start = page * 10
+            for promo in codes[start:start + 10]:
+                text_lines.append(_format_promo_line(promo))
+        await callback.message.edit_text(
+            "\n".join(text_lines),
+            reply_markup=_build_promo_list_keyboard(codes, page=page),
+            parse_mode='HTML'
+        )
+
+    @admin_router.callback_query(F.data.startswith("admin_promo_toggle_"))
+    async def admin_promo_toggle(callback: types.CallbackQuery, state: FSMContext):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("У вас нет прав.")
+            return
+        code = callback.data.split("admin_promo_toggle_")[-1]
+        codes = list_promo_codes(include_inactive=True) or []
+        target = next((p for p in codes if (p.get('code') or '').upper() == code.upper()), None)
+        if not target:
+            await callback.answer("Промокод не найден", show_alert=True)
+            return
+        new_status = not bool(target.get('is_active'))
+        update_promo_code_status(code, is_active=new_status)
+        await callback.answer("Статус обновлён")
+        page = (await state.get_data()).get('promo_page', 0)
+        codes = list_promo_codes(include_inactive=True) or []
+        text_lines = ["🎟 <b>Доступные промокоды</b>"]
+        if not codes:
+            text_lines.append("Пока нет созданных промокодов.")
+        else:
+            start = page * 10
+            for promo in codes[start:start + 10]:
+                text_lines.append(_format_promo_line(promo))
+        await callback.message.edit_text(
+            "\n".join(text_lines),
+            reply_markup=_build_promo_list_keyboard(codes, page=page),
+            parse_mode='HTML'
+        )
+
+
     @admin_router.callback_query(F.data == "admin_speedtest")
     async def admin_speedtest_entry(callback: types.CallbackQuery):
         if not is_admin(callback.from_user.id):
             await callback.answer("У вас нет прав.", show_alert=True)
             return
         await callback.answer()
-        hosts = get_all_hosts() or []
-        if not hosts:
-            await callback.message.answer("⚠️ Хосты не найдены в настройках.")
-            return
-        await callback.message.edit_text(
-            "⚡ Выберите хост для теста скорости:",
-            reply_markup=keyboards.create_admin_hosts_pick_keyboard(hosts, action="speedtest")
-        )
 
-    # --- Speedtest: запуск по выбранному хосту ---
+        targets = get_all_ssh_targets() or []
+        try:
+            await callback.message.edit_text(
+                "🔌 <b>SSH цели для Speedtest</b>\nВыберите цель:",
+                reply_markup=keyboards.create_admin_ssh_targets_keyboard(targets)
+            )
+        except Exception:
+            await callback.message.answer(
+                "🔌 <b>SSH цели для Speedtest</b>\nВыберите цель:",
+                reply_markup=keyboards.create_admin_ssh_targets_keyboard(targets)
+            )
+
+
+    @admin_router.callback_query(F.data == "admin_speedtest_ssh_targets")
+    async def admin_speedtest_ssh_targets(callback: types.CallbackQuery):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("У вас нет прав.", show_alert=True)
+            return
+        await callback.answer()
+        targets = get_all_ssh_targets() or []
+        try:
+            await callback.message.edit_text(
+                "🔌 <b>SSH цели для Speedtest</b>\nВыберите цель:",
+                reply_markup=keyboards.create_admin_ssh_targets_keyboard(targets)
+            )
+        except Exception:
+            await callback.message.answer(
+                "🔌 <b>SSH цели для Speedtest</b>\nВыберите цель:",
+                reply_markup=keyboards.create_admin_ssh_targets_keyboard(targets)
+            )
+
+
     @admin_router.callback_query(F.data.startswith("admin_speedtest_pick_host_"))
     async def admin_speedtest_run(callback: types.CallbackQuery):
         if not is_admin(callback.from_user.id):
@@ -139,9 +827,9 @@ def get_admin_router() -> Router:
         await callback.answer()
         host_name = callback.data.replace("admin_speedtest_pick_host_", "", 1)
 
-        # Уведомление всем администраторам о старте
+
         try:
-            from shop_bot.data_manager.database import get_admin_ids
+            from shop_bot.data_manager.remnawave_repository import get_admin_ids
             admin_ids = list({*(get_admin_ids() or []), int(callback.from_user.id)})
         except Exception:
             admin_ids = [int(callback.from_user.id)]
@@ -153,19 +841,19 @@ def get_admin_router() -> Router:
             except Exception:
                 pass
 
-        # Локальный статус
+
         try:
             wait_msg = await callback.message.answer(f"⏳ Выполняю тест скорости для <b>{host_name}</b>…")
         except Exception:
             wait_msg = None
 
-        # Выполнить тест (SSH + NET) и сохранить в БД
+
         try:
             result = await speedtest_runner.run_both_for_host(host_name)
         except Exception as e:
             result = {"ok": False, "error": str(e), "details": {}}
 
-        # Текст результата
+
         def fmt_part(title: str, d: dict | None) -> str:
             if not d:
                 return f"<b>{title}:</b> —"
@@ -188,7 +876,19 @@ def get_admin_router() -> Router:
             + fmt_part("NET", details.get('net'))
         )
 
-        # Локально обновим сообщение
+
+
+        if result.get('ok'):
+            logger.info(f"Bot/Admin: спидтест для SSH-цели '{host_name}' завершён успешно")
+        else:
+            logger.warning(f"Bot/Admin: спидтест для SSH-цели '{host_name}' завершился с ошибкой: {result.get('error')}")
+
+
+        if result.get('ok'):
+            logger.info(f"Bot/Admin: спидтест (legacy) для SSH-цели '{host_name}' завершён успешно")
+        else:
+            logger.warning(f"Bot/Admin: спидтест (legacy) для SSH-цели '{host_name}' завершился с ошибкой: {result.get('error')}")
+
         if wait_msg:
             try:
                 await wait_msg.edit_text(text_res)
@@ -197,7 +897,7 @@ def get_admin_router() -> Router:
         else:
             await callback.message.answer(text_res)
 
-        # Разослать финал всем админам
+
         for aid in admin_ids:
             if wait_msg and aid == callback.from_user.id:
                 continue
@@ -206,7 +906,149 @@ def get_admin_router() -> Router:
             except Exception:
                 pass
 
-    # --- Speedtest: Назад из выбора хоста ---
+
+    @admin_router.callback_query(F.data.startswith("stt:"))
+    async def admin_speedtest_run_target_hashed(callback: types.CallbackQuery):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("У вас нет прав.", show_alert=True)
+            return
+        await callback.answer()
+        target_name = _resolve_target_from_hash(callback.data)
+        if not target_name:
+            await callback.message.answer("❌ Цель не найдена")
+            return
+
+
+        logger.info(f"Bot/Admin: запуск спидтеста для SSH-цели '{target_name}' (инициатор id={callback.from_user.id})")
+        try:
+            from shop_bot.data_manager.remnawave_repository import get_admin_ids
+            admin_ids = list({*(get_admin_ids() or []), int(callback.from_user.id)})
+        except Exception:
+            admin_ids = [int(callback.from_user.id)]
+        initiator = _format_user_mention(callback.from_user)
+        start_text = f"🚀 Запущен тест скорости (SSH-цель): <b>{target_name}</b>\n(инициатор: {initiator})"
+        for aid in admin_ids:
+            try:
+                await callback.bot.send_message(aid, start_text)
+            except Exception:
+                pass
+
+
+        try:
+            wait_msg = await callback.message.answer(f"⏳ Выполняю тест скорости для SSH-цели <b>{target_name}</b>…")
+        except Exception:
+            wait_msg = None
+
+
+        try:
+            result = await speedtest_runner.run_and_store_ssh_speedtest_for_target(target_name)
+        except Exception as e:
+            result = {"ok": False, "error": str(e)}
+
+        if not result.get("ok"):
+            text_res = f"🏁 Тест скорости (SSH-цель) завершён для <b>{target_name}</b>\n❌ {result.get('error') or 'ошибка'}"
+        else:
+            ping = result.get('ping_ms')
+            down = result.get('download_mbps')
+            up = result.get('upload_mbps')
+            srv = result.get('server_name') or '—'
+            text_res = (
+                f"🏁 Тест скорости (SSH-цель) завершён для <b>{target_name}</b>\n\n"
+                f"<b>SSH:</b> ✅\n"
+                f"• ping: {ping if ping is not None else '—'} ms\n"
+                f"• ↓ {down if down is not None else '—'} Mbps\n"
+                f"• ↑ {up if up is not None else '—'} Mbps\n"
+                f"• сервер: {srv}"
+            )
+
+        if wait_msg:
+            try:
+                await wait_msg.edit_text(text_res)
+            except Exception:
+                await callback.message.answer(text_res)
+        else:
+            await callback.message.answer(text_res)
+
+        for aid in admin_ids:
+            if wait_msg and aid == callback.from_user.id:
+                continue
+            try:
+                await callback.bot.send_message(aid, text_res)
+            except Exception:
+                pass
+
+
+    @admin_router.callback_query(F.data.startswith("admin_speedtest_pick_target_"))
+    async def admin_speedtest_run_target(callback: types.CallbackQuery):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("У вас нет прав.", show_alert=True)
+            return
+        await callback.answer()
+        target_name = callback.data.replace("admin_speedtest_pick_target_", "", 1)
+
+
+        logger.info(f"Bot/Admin: запуск спидтеста (legacy) для SSH-цели '{target_name}' (инициатор id={callback.from_user.id})")
+        try:
+            from shop_bot.data_manager.remnawave_repository import get_admin_ids
+            admin_ids = list({*(get_admin_ids() or []), int(callback.from_user.id)})
+        except Exception:
+            admin_ids = [int(callback.from_user.id)]
+        initiator = _format_user_mention(callback.from_user)
+        start_text = f"🚀 Запущен тест скорости (SSH-цель): <b>{target_name}</b>\n(инициатор: {initiator})"
+        for aid in admin_ids:
+            try:
+                await callback.bot.send_message(aid, start_text)
+            except Exception:
+                pass
+
+
+        try:
+            wait_msg = await callback.message.answer(f"⏳ Выполняю тест скорости для SSH-цели <b>{target_name}</b>…")
+        except Exception:
+            wait_msg = None
+
+
+        try:
+            result = await speedtest_runner.run_and_store_ssh_speedtest_for_target(target_name)
+        except Exception as e:
+            result = {"ok": False, "error": str(e)}
+
+
+        if not result.get("ok"):
+            text_res = f"🏁 Тест скорости (SSH-цель) завершён для <b>{target_name}</b>\n❌ {result.get('error') or 'ошибка'}"
+        else:
+            ping = result.get('ping_ms')
+            down = result.get('download_mbps')
+            up = result.get('upload_mbps')
+            srv = result.get('server_name') or '—'
+            text_res = (
+                f"🏁 Тест скорости (SSH-цель) завершён для <b>{target_name}</b>\n\n"
+                f"<b>SSH:</b> ✅\n"
+                f"• ping: {ping if ping is not None else '—'} ms\n"
+                f"• ↓ {down if down is not None else '—'} Mbps\n"
+                f"• ↑ {up if up is not None else '—'} Mbps\n"
+                f"• сервер: {srv}"
+            )
+
+
+        if wait_msg:
+            try:
+                await wait_msg.edit_text(text_res)
+            except Exception:
+                await callback.message.answer(text_res)
+        else:
+            await callback.message.answer(text_res)
+
+
+        for aid in admin_ids:
+            if wait_msg and aid == callback.from_user.id:
+                continue
+            try:
+                await callback.bot.send_message(aid, text_res)
+            except Exception:
+                pass
+
+
     @admin_router.callback_query(F.data == "admin_speedtest_back_to_users")
     async def admin_speedtest_back(callback: types.CallbackQuery):
         if not is_admin(callback.from_user.id):
@@ -215,16 +1057,16 @@ def get_admin_router() -> Router:
         await callback.answer()
         await show_admin_menu(callback.message, edit_message=True)
 
-    # --- Speedtest: Запуск для всех хостов ---
+
     @admin_router.callback_query(F.data == "admin_speedtest_run_all")
     async def admin_speedtest_run_all(callback: types.CallbackQuery):
         if not is_admin(callback.from_user.id):
             await callback.answer("У вас нет прав.", show_alert=True)
             return
         await callback.answer()
-        # оповещение админам
+
         try:
-            from shop_bot.data_manager.database import get_admin_ids
+            from shop_bot.data_manager.remnawave_repository import get_admin_ids
             admin_ids = list({*(get_admin_ids() or []), int(callback.from_user.id)})
         except Exception:
             admin_ids = [int(callback.from_user.id)]
@@ -235,7 +1077,7 @@ def get_admin_router() -> Router:
                 await callback.bot.send_message(aid, start_text)
             except Exception:
                 pass
-        # пробежимся по хостам
+
         hosts = get_all_hosts() or []
         summary_lines = []
         for h in hosts:
@@ -252,7 +1094,7 @@ def get_admin_router() -> Router:
         text = "🏁 Тест для всех завершён:\n" + "\n".join(summary_lines)
         await callback.message.answer(text)
         for aid in admin_ids:
-            # Не дублируем результат инициатору/в текущий чат
+
             if aid == callback.from_user.id or aid == callback.message.chat.id:
                 continue
             try:
@@ -260,7 +1102,57 @@ def get_admin_router() -> Router:
             except Exception:
                 pass
 
-    # --- Бэкап БД: ручной запуск ---
+
+    @admin_router.callback_query(F.data == "admin_speedtest_run_all_targets")
+    async def admin_speedtest_run_all_targets(callback: types.CallbackQuery):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("У вас нет прав.", show_alert=True)
+            return
+        await callback.answer()
+
+        try:
+            from shop_bot.data_manager.remnawave_repository import get_admin_ids
+            admin_ids = list({*(get_admin_ids() or []), int(callback.from_user.id)})
+        except Exception:
+            admin_ids = [int(callback.from_user.id)]
+        initiator = _format_user_mention(callback.from_user)
+        start_text = f"🚀 Запущен тест скорости для всех SSH-целей\n(инициатор: {initiator})"
+        logger.info(f"Bot/Admin: запуск спидтеста ДЛЯ ВСЕХ SSH-целей (инициатор id={callback.from_user.id})")
+        for aid in admin_ids:
+            try:
+                await callback.bot.send_message(aid, start_text)
+            except Exception:
+                pass
+
+        targets = get_all_ssh_targets() or []
+        summary_lines = []
+        ok_total = 0
+        for t in targets:
+            name = (t.get('target_name') or '').strip()
+            if not name:
+                continue
+            try:
+                res = await speedtest_runner.run_and_store_ssh_speedtest_for_target(name)
+                ok = bool(res.get('ok'))
+                dm = res.get('download_mbps')
+                um = res.get('upload_mbps')
+                summary_lines.append(f"• {name}: {'✅' if ok else '❌'} ↓ {dm or '—'} ↑ {um or '—'}")
+                if ok:
+                    ok_total += 1
+            except Exception as e:
+                summary_lines.append(f"• {name}: ❌ {e}")
+        text = "🏁 SSH-цели: тест для всех завершён:\n" + ("\n".join(summary_lines) if summary_lines else "(нет целей)")
+        logger.info(f"Bot/Admin: завершён спидтест ДЛЯ ВСЕХ SSH-целей: ок={ok_total}, всего={len(targets)}")
+        await callback.message.answer(text)
+        for aid in admin_ids:
+            if aid == callback.from_user.id or aid == callback.message.chat.id:
+                continue
+            try:
+                await callback.bot.send_message(aid, text)
+            except Exception:
+                pass
+
+
     @admin_router.callback_query(F.data == "admin_backup_db")
     async def admin_backup_db(callback: types.CallbackQuery):
         if not is_admin(callback.from_user.id):
@@ -278,7 +1170,7 @@ def get_admin_router() -> Router:
             else:
                 await callback.message.answer("❌ Не удалось создать бэкап БД")
             return
-        # Отправим всем администраторам
+
         try:
             sent = await backup_manager.send_backup_to_admins(callback.bot, zip_path)
         except Exception:
@@ -292,7 +1184,7 @@ def get_admin_router() -> Router:
         else:
             await callback.message.answer(txt)
 
-    # --- Восстановление БД ---
+
     class AdminRestoreDB(StatesGroup):
         waiting_file = State()
 
@@ -343,7 +1235,7 @@ def get_admin_router() -> Router:
         else:
             await message.answer("❌ Восстановление не удалось. Проверьте файл и повторите.")
 
-    # --- Speedtest: Автоустановка speedtest на выбранном хосте ---
+
     @admin_router.callback_query(F.data.startswith("admin_speedtest_autoinstall_"))
     async def admin_speedtest_autoinstall(callback: types.CallbackQuery):
         if not is_admin(callback.from_user.id):
@@ -367,11 +1259,71 @@ def get_admin_router() -> Router:
                 await wait.edit_text(text)
             except Exception:
                 await callback.message.answer(text)
+
+
+    @admin_router.callback_query(F.data.startswith("admin_speedtest_autoinstall_target_"))
+    async def admin_speedtest_autoinstall_target(callback: types.CallbackQuery):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("У вас нет прав.", show_alert=True)
+            return
+        await callback.answer()
+        target_name = callback.data.replace("admin_speedtest_autoinstall_target_", "", 1)
+        try:
+            wait = await callback.message.answer(f"🛠 Пытаюсь установить speedtest на SSH-цели <b>{target_name}</b>…")
+        except Exception:
+            wait = None
+        from shop_bot.data_manager.speedtest_runner import auto_install_speedtest_on_target
+        logger.info(f"Bot/Admin: автоустановка speedtest на SSH-цели '{target_name}' (инициатор id={callback.from_user.id})")
+        try:
+            res = await auto_install_speedtest_on_target(target_name)
+        except Exception as e:
+            res = {"ok": False, "log": f"Ошибка: {e}"}
+        text = ("✅ Автоустановка завершена успешно" if res.get("ok") else "❌ Автоустановка завершилась с ошибкой")
+        text += f"\n<pre>{(res.get('log') or '')[:3500]}</pre>"
+        if res.get('ok'):
+            logger.info(f"Bot/Admin: автоустановка завершена успешно для '{target_name}'")
+        else:
+            logger.warning(f"Bot/Admin: автоустановка завершилась с ошибкой для '{target_name}'")
+        if wait:
+            try:
+                await wait.edit_text(text)
+            except Exception:
+                await callback.message.answer(text)
         else:
             await callback.message.answer(text)
 
 
-    # --- Пользователи: список, пагинация, просмотр ---
+    @admin_router.callback_query(F.data.startswith("stti:"))
+    async def admin_speedtest_autoinstall_target_hashed(callback: types.CallbackQuery):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("У вас нет прав.", show_alert=True)
+            return
+        await callback.answer()
+        target_name = _resolve_target_from_hash(callback.data)
+        if not target_name:
+            await callback.message.answer("❌ Цель не найдена")
+            return
+        try:
+            wait = await callback.message.answer(f"🛠 Пытаюсь установить speedtest на SSH-цели <b>{target_name}</b>…")
+        except Exception:
+            wait = None
+        from shop_bot.data_manager.speedtest_runner import auto_install_speedtest_on_target
+        try:
+            res = await auto_install_speedtest_on_target(target_name)
+        except Exception as e:
+            res = {"ok": False, "log": f"Ошибка: {e}"}
+        text = ("✅ Автоустановка завершена успешно" if res.get("ok") else "❌ Автоустановка завершилась с ошибкой")
+        text += f"\n<pre>{(res.get('log') or '')[:3500]}</pre>"
+        if wait:
+            try:
+                await wait.edit_text(text)
+            except Exception:
+                await callback.message.answer(text)
+        else:
+            await callback.message.answer(text)
+
+
+
     @admin_router.callback_query(F.data.startswith("admin_users"))
     async def admin_users_handler(callback: types.CallbackQuery, state: FSMContext):
         if not is_admin(callback.from_user.id):
@@ -405,9 +1357,9 @@ def get_admin_router() -> Router:
         if not user:
             await callback.message.answer("❌ Пользователь не найден")
             return
-        # Собираем краткую информацию
+
         username = user.get('username') or '—'
-        # Формируем кликабельный тег пользователя
+
         if user.get('username'):
             uname = user.get('username').lstrip('@')
             user_tag = f"<a href='https://t.me/{uname}'>@{uname}</a>"
@@ -433,7 +1385,7 @@ def get_admin_router() -> Router:
             reply_markup=keyboards.create_admin_user_actions_keyboard(user_id, is_banned=is_banned)
         )
 
-    # --- Бан/разбан пользователя ---
+
     @admin_router.callback_query(F.data.startswith("admin_ban_user_"))
     async def admin_ban_user(callback: types.CallbackQuery):
         if not is_admin(callback.from_user.id):
@@ -449,13 +1401,13 @@ def get_admin_router() -> Router:
             ban_user(user_id)
             await callback.message.answer(f"🚫 Пользователь {user_id} забанен")
             try:
-                # Уведомление пользователю: только кнопка поддержки, без "Назад в меню"
-                from shop_bot.data_manager.database import get_setting as _get_setting
+
+                from shop_bot.data_manager.remnawave_repository import get_setting as _get_setting
                 support = (_get_setting("support_bot_username") or _get_setting("support_user") or "").strip()
                 kb = InlineKeyboardBuilder()
                 url = None
                 if support:
-                    if support.startswith("@"):  # @username
+                    if support.startswith("@"):
                         url = f"tg://resolve?domain={support[1:]}"
                     elif support.startswith("tg://"):
                         url = support
@@ -482,7 +1434,7 @@ def get_admin_router() -> Router:
         except Exception as e:
             await callback.message.answer(f"❌ Не удалось забанить пользователя: {e}")
             return
-        # Обновить карточку пользователя
+
         user = get_user(user_id) or {}
         username = user.get('username') or '—'
         if user.get('username'):
@@ -512,7 +1464,7 @@ def get_admin_router() -> Router:
         except Exception:
             pass
 
-    # --- Подменю администраторов ---
+
     @admin_router.callback_query(F.data == "admin_admins_menu")
     async def admin_admins_menu_entry(callback: types.CallbackQuery):
         if not is_admin(callback.from_user.id):
@@ -531,7 +1483,7 @@ def get_admin_router() -> Router:
             return
         await callback.answer()
         try:
-            from shop_bot.data_manager.database import get_admin_ids
+            from shop_bot.data_manager.remnawave_repository import get_admin_ids
             ids = list(get_admin_ids() or [])
         except Exception:
             ids = []
@@ -552,7 +1504,7 @@ def get_admin_router() -> Router:
                     tag = f"<a href='tg://user?id={aid}'>Профиль</a>"
                 lines.append(f"• ID: {aid} — {tag}")
             text = "📋 <b>Администраторы</b>:\n" + "\n".join(lines)
-        # Кнопки назад
+
         kb = InlineKeyboardBuilder()
         kb.button(text="⬅️ Назад", callback_data="admin_admins_menu")
         kb.button(text="⬅️ В админ-меню", callback_data="admin_menu")
@@ -577,7 +1529,7 @@ def get_admin_router() -> Router:
             unban_user(user_id)
             await callback.message.answer(f"✅ Пользователь {user_id} разбанен")
             try:
-                # Отправляем пользователю уведомление о разбане с кнопкой в главное меню
+
                 kb = InlineKeyboardBuilder()
                 kb.row(keyboards.get_main_menu_button())
                 await callback.bot.send_message(
@@ -590,10 +1542,10 @@ def get_admin_router() -> Router:
         except Exception as e:
             await callback.message.answer(f"❌ Не удалось разбанить пользователя: {e}")
             return
-        # Обновить карточку пользователя
+
         user = get_user(user_id) or {}
         username = user.get('username') or '—'
-        # Формируем кликабельный тег пользователя
+
         if user.get('username'):
             uname = user.get('username').lstrip('@')
             user_tag = f"<a href='https://t.me/{uname}'>@{uname}</a>"
@@ -621,7 +1573,7 @@ def get_admin_router() -> Router:
         except Exception:
             pass
 
-    # --- Ключи пользователя: список и карточка ключа ---
+
     @admin_router.callback_query(F.data.startswith("admin_user_keys_"))
     async def admin_user_keys(callback: types.CallbackQuery):
         if not is_admin(callback.from_user.id):
@@ -660,7 +1612,7 @@ def get_admin_router() -> Router:
             total_ref_earned = float(get_referral_balance_all(user_id) or 0)
         except Exception:
             total_ref_earned = 0.0
-        # Сформируем список с ограничением по длине
+
         max_items = 30
         lines = []
         for r in refs[:max_items]:
@@ -677,7 +1629,7 @@ def get_admin_router() -> Router:
             + ("\n".join(lines) if lines else "Пока нет рефералов")
             + more_suffix
         )
-        # Кнопки: назад к карточке пользователя и в админ-меню
+
         kb = InlineKeyboardBuilder()
         kb.button(text="⬅️ К пользователю", callback_data=f"admin_view_user_{user_id}")
         kb.button(text="⬅️ В админ-меню", callback_data="admin_menu")
@@ -698,7 +1650,7 @@ def get_admin_router() -> Router:
         except Exception:
             await callback.message.answer("❌ Неверный формат key_id")
             return
-        key = get_key_by_id(key_id)
+        key = rw_repo.get_key_by_id(key_id)
         if not key:
             await callback.message.answer("❌ Ключ не найден")
             return
@@ -714,27 +1666,27 @@ def get_admin_router() -> Router:
                 reply_markup=keyboards.create_admin_key_actions_keyboard(key_id, int(key.get('user_id')) if key and key.get('user_id') else None)
             )
         except Exception as e:
-            logger.debug(f"edit_text failed in delete cancel for key #{key_id}: {e}")
+            logger.debug(f"edit_text не удался в отмене удаления для ключа #{key_id}: {e}")
             await callback.message.answer(
                 text,
                 reply_markup=keyboards.create_admin_key_actions_keyboard(key_id, int(key.get('user_id')) if key and key.get('user_id') else None)
             )
 
-    # --- Удаление ключа: подтверждение (prompt) ---
-    # Матчим только вариант admin_key_delete_{id}, без confirm/cancel
+
+
     @admin_router.callback_query(F.data.regexp(r"^admin_key_delete_\d+$"))
     async def admin_key_delete_prompt(callback: types.CallbackQuery):
         if not is_admin(callback.from_user.id):
             await callback.answer("У вас нет прав.", show_alert=True)
             return
         await callback.answer()
-        logger.info(f"admin_key_delete_prompt received: data='{callback.data}' from {callback.from_user.id}")
+        logger.info(f"Получен запрос на удаление ключа: data='{callback.data}' от {callback.from_user.id}")
         try:
             key_id = int(callback.data.split("_")[-1])
         except Exception:
             await callback.message.answer("❌ Неверный формат key_id")
             return
-        key = get_key_by_id(key_id)
+        key = rw_repo.get_key_by_id(key_id)
         if not key:
             await callback.message.answer("❌ Ключ не найден")
             return
@@ -746,13 +1698,13 @@ def get_admin_router() -> Router:
                 reply_markup=keyboards.create_admin_delete_key_confirm_keyboard(key_id)
             )
         except Exception as e:
-            logger.debug(f"edit_text failed in delete prompt for key #{key_id}: {e}")
+            logger.debug(f"edit_text не удался в запросе удаления для ключа #{key_id}: {e}")
             await callback.message.answer(
                 f"Вы уверены, что хотите удалить ключ #{key_id}?\nEmail: {email}\nСервер: {host}",
                 reply_markup=keyboards.create_admin_delete_key_confirm_keyboard(key_id)
             )
 
-    # --- Продление конкретного ключа из карточки ---
+
     class AdminExtendSingleKey(StatesGroup):
         waiting_days = State()
 
@@ -792,7 +1744,7 @@ def get_admin_router() -> Router:
         if days <= 0:
             await message.answer("❌ Дней должно быть положительное число")
             return
-        key = get_key_by_id(key_id)
+        key = rw_repo.get_key_by_id(key_id)
         if not key:
             await message.answer("❌ Ключ не найден")
             await state.clear()
@@ -803,23 +1755,26 @@ def get_admin_router() -> Router:
             await message.answer("❌ У ключа отсутствует сервер или email")
             await state.clear()
             return
-        # Продление на хосте
+
         try:
             resp = await create_or_update_key_on_host(host, email, days_to_add=days)
         except Exception as e:
-            logger.error(f"Admin key extend: host update failed for key #{key_id}: {e}")
+            logger.error(f"Продление ключа админом: не удалось обновить хост для ключа #{key_id}: {e}")
             resp = None
         if not resp or not resp.get('client_uuid') or not resp.get('expiry_timestamp_ms'):
             await message.answer("❌ Не удалось продлить ключ на сервере")
             return
-        # Обновление в БД
-        try:
-            update_key_info(key_id, resp['client_uuid'], int(resp['expiry_timestamp_ms']))
-        except Exception as e:
-            logger.error(f"Admin key extend: DB update failed for key #{key_id}: {e}")
+
+        if not rw_repo.update_key(
+            key_id,
+            remnawave_user_uuid=resp['client_uuid'],
+            expire_at_ms=int(resp['expiry_timestamp_ms']),
+        ):
+            await message.answer("❌ Не удалось обновить информацию о ключе.")
+            return
         await state.clear()
-        # Повторный показ карточки ключа
-        new_key = get_key_by_id(key_id)
+
+        new_key = rw_repo.get_key_by_id(key_id)
         text = (
             f"🔑 <b>Ключ #{key_id}</b>\n"
             f"Хост: {new_key.get('host_name') or '—'}\n"
@@ -829,7 +1784,7 @@ def get_admin_router() -> Router:
         await message.answer(f"✅ Ключ продлён на {days} дн.")
         await message.answer(text, reply_markup=keyboards.create_admin_key_actions_keyboard(key_id, int(new_key.get('user_id')) if new_key and new_key.get('user_id') else None))
 
-    # --- Управление администраторами: добавить админа ---
+
     class AdminAddAdmin(StatesGroup):
         waiting_for_input = State()
 
@@ -852,29 +1807,29 @@ def get_admin_router() -> Router:
             return
         raw = (message.text or '').strip()
         target_id: int | None = None
-        # Попытка распарсить как число
+
         if raw.isdigit():
             try:
                 target_id = int(raw)
             except Exception:
                 target_id = None
-        # Если @username
+
         if target_id is None and raw.startswith('@'):
             uname = raw.lstrip('@')
-            # 1) Пробуем как передано (@username)
+
             try:
                 chat = await message.bot.get_chat(raw)
                 target_id = int(chat.id)
             except Exception:
                 target_id = None
-            # 2) Пробуем без @ (username)
+
             if target_id is None:
                 try:
                     chat = await message.bot.get_chat(uname)
                     target_id = int(chat.id)
                 except Exception:
                     target_id = None
-            # 3) Фолбэк: ищем пользователя в локальной БД по username
+
             if target_id is None:
                 try:
                     users = get_all_users() or []
@@ -889,25 +1844,25 @@ def get_admin_router() -> Router:
         if target_id is None:
             await message.answer("❌ Не удалось распознать ID/username. Отправьте корректное значение или нажмите Отмена.")
             return
-        # Обновляем настройки админов
+
         try:
-            from shop_bot.data_manager.database import get_admin_ids, update_setting
+            from shop_bot.data_manager.remnawave_repository import get_admin_ids, update_setting
             ids = set(get_admin_ids())
             ids.add(int(target_id))
-            # Сохраняем в admin_telegram_ids строкой CSV
+
             ids_str = ",".join(str(i) for i in sorted(ids))
             update_setting("admin_telegram_ids", ids_str)
             await message.answer(f"✅ Пользователь {target_id} добавлен в администраторы.")
         except Exception as e:
             await message.answer(f"❌ Ошибка при сохранении: {e}")
         await state.clear()
-        # Показать админ-меню снова
+
         try:
             await show_admin_menu(message)
         except Exception:
             pass
 
-    # --- Снятие прав администратора ---
+
     class AdminRemoveAdmin(StatesGroup):
         waiting_for_input = State()
 
@@ -930,29 +1885,29 @@ def get_admin_router() -> Router:
             return
         raw = (message.text or '').strip()
         target_id: int | None = None
-        # Попытка распарсить как число
+
         if raw.isdigit():
             try:
                 target_id = int(raw)
             except Exception:
                 target_id = None
-        # Резолвим username (@username или username)
+
         if target_id is None:
             uname = raw.lstrip('@')
-            # 1) Пробуем как введено
+
             try:
                 chat = await message.bot.get_chat(raw)
                 target_id = int(chat.id)
             except Exception:
                 target_id = None
-            # 2) Пробуем без @
+
             if target_id is None and uname:
                 try:
                     chat = await message.bot.get_chat(uname)
                     target_id = int(chat.id)
                 except Exception:
                     target_id = None
-            # 3) Фолбэк: поиск в БД
+
             if target_id is None and uname:
                 try:
                     users = get_all_users() or []
@@ -967,9 +1922,9 @@ def get_admin_router() -> Router:
         if target_id is None:
             await message.answer("❌ Не удалось распознать ID/username. Отправьте корректное значение или нажмите Отмена.")
             return
-        # Обновляем настройки админов
+
         try:
-            from shop_bot.data_manager.database import get_admin_ids, update_setting
+            from shop_bot.data_manager.remnawave_repository import get_admin_ids, update_setting
             ids = set(get_admin_ids())
             if target_id not in ids:
                 await message.answer(f"ℹ️ Пользователь {target_id} не является администратором.")
@@ -989,13 +1944,13 @@ def get_admin_router() -> Router:
         except Exception as e:
             await message.answer(f"❌ Ошибка при сохранении: {e}")
         await state.clear()
-        # Показать админ-меню снова
+
         try:
             await show_admin_menu(message)
         except Exception:
             pass
 
-    # --- Удаление ключа: отмена ---
+
     @admin_router.callback_query(F.data.startswith("admin_key_delete_cancel_"))
     async def admin_key_delete_cancel(callback: types.CallbackQuery):
         if not is_admin(callback.from_user.id):
@@ -1005,12 +1960,12 @@ def get_admin_router() -> Router:
             await callback.answer("Отменено")
         except Exception:
             pass
-        logger.info(f"admin_key_delete_cancel received: data='{callback.data}' from {callback.from_user.id}")
+        logger.info(f"Получена отмена удаления ключа: data='{callback.data}' от {callback.from_user.id}")
         try:
             key_id = int(callback.data.split("_")[-1])
         except Exception:
             return
-        key = get_key_by_id(key_id)
+        key = rw_repo.get_key_by_id(key_id)
         if not key:
             return
         text = (
@@ -1025,13 +1980,13 @@ def get_admin_router() -> Router:
                 reply_markup=keyboards.create_admin_key_actions_keyboard(key_id, int(key.get('user_id')) if key and key.get('user_id') else None)
             )
         except Exception as e:
-            logger.debug(f"edit_text failed in delete cancel for key #{key_id}: {e}")
+            logger.debug(f"edit_text не удался в отмене удаления для ключа #{key_id}: {e}")
             await callback.message.answer(
                 text,
                 reply_markup=keyboards.create_admin_key_actions_keyboard(key_id, int(key.get('user_id')) if key and key.get('user_id') else None)
             )
 
-    # --- Удаление ключа: подтверждение и выполнение ---
+
     @admin_router.callback_query(F.data.startswith("admin_key_delete_confirm_"))
     async def admin_key_delete_confirm(callback: types.CallbackQuery):
         if not is_admin(callback.from_user.id):
@@ -1041,16 +1996,16 @@ def get_admin_router() -> Router:
             await callback.answer("Удаляю…")
         except Exception:
             pass
-        logger.info(f"admin_key_delete_confirm received: data='{callback.data}' from {callback.from_user.id}")
+        logger.info(f"Получено подтверждение удаления ключа: data='{callback.data}' от {callback.from_user.id}")
         try:
             key_id = int(callback.data.split('_')[-1])
         except Exception:
             await callback.message.answer("❌ Неверный формат key_id")
             return
         try:
-            key = get_key_by_id(key_id)
+            key = rw_repo.get_key_by_id(key_id)
         except Exception as e:
-            logger.error(f"DB get_key_by_id failed for #{key_id}: {e}")
+            logger.error(f"БД get_key_by_id не удался для #{key_id}: {e}")
             key = None
         if not key:
             await callback.message.answer("❌ Ключ не найден")
@@ -1058,7 +2013,7 @@ def get_admin_router() -> Router:
         try:
             user_id = int(key.get('user_id'))
         except Exception as e:
-            logger.error(f"Invalid user_id for key #{key_id}: {key.get('user_id')}, err={e}")
+            logger.error(f"Неверный user_id для ключа #{key_id}: {key.get('user_id')}, err={e}")
             await callback.message.answer("❌ Ошибка данных ключа: некорректный пользователь")
             return
         host = key.get('host_name')
@@ -1069,15 +2024,15 @@ def get_admin_router() -> Router:
                 ok_host = await delete_client_on_host(host, email)
             except Exception as e:
                 ok_host = False
-                logger.error(f"Failed to delete client on host '{host}' for key #{key_id}: {e}")
+                logger.error(f"Не удалось удалить клиента на хосте '{host}' для ключа #{key_id}: {e}")
         ok_db = False
         try:
             ok_db = delete_key_by_email(email)
         except Exception as e:
-            logger.error(f"Failed to delete key in DB for email '{email}': {e}")
+            logger.error(f"Не удалось удалить ключ в БД для email '{email}': {e}")
         if ok_db:
             await callback.message.answer("✅ Ключ удалён" + (" (с хоста тоже)" if ok_host else " (но удалить на хосте не удалось)"))
-            # Обновить список ключей пользователя
+
             keys = get_keys_for_user(user_id)
             try:
                 await callback.message.edit_text(
@@ -1085,12 +2040,12 @@ def get_admin_router() -> Router:
                     reply_markup=keyboards.create_admin_user_keys_keyboard(user_id, keys)
                 )
             except Exception as e:
-                logger.debug(f"edit_text failed in delete confirm list refresh for user {user_id}: {e}")
+                logger.debug(f"edit_text не удался в обновлении списка подтверждения удаления для пользователя {user_id}: {e}")
                 await callback.message.answer(
                     f"🔑 Ключи пользователя {user_id}:",
                     reply_markup=keyboards.create_admin_user_keys_keyboard(user_id, keys)
                 )
-            # Уведомление пользователю (если получится)
+
             try:
                 await callback.bot.send_message(
                     user_id,
@@ -1140,47 +2095,9 @@ def get_admin_router() -> Router:
             await message.answer("❌ Не удалось обновить email (возможно, уже занят)")
         await state.clear()
 
-    class AdminEditKeyHost(StatesGroup):
-        waiting_for_host = State()
 
-    @admin_router.callback_query(F.data.startswith("admin_key_edit_host_"))
-    async def admin_key_edit_host_start(callback: types.CallbackQuery, state: FSMContext):
-        if not is_admin(callback.from_user.id):
-            await callback.answer("У вас нет прав.", show_alert=True)
-            return
-        await callback.answer()
-        try:
-            key_id = int(callback.data.split("_")[-1])
-        except Exception:
-            await callback.message.answer("❌ Неверный формат key_id")
-            return
-        await state.update_data(edit_key_id=key_id)
-        await state.set_state(AdminEditKeyHost.waiting_for_host)
-        await callback.message.edit_text(
-            f"Введите новое имя сервера (host) для ключа #{key_id}",
-            reply_markup=keyboards.create_admin_cancel_keyboard()
-        )
 
-    @admin_router.message(AdminEditKeyHost.waiting_for_host)
-    async def admin_key_edit_host_commit(message: types.Message, state: FSMContext):
-        if not is_admin(message.from_user.id):
-            return
-        data = await state.get_data()
-        key_id = int(data.get('edit_key_id'))
-        new_host = (message.text or '').strip()
-        if not new_host:
-            await message.answer("❌ Введите корректное имя сервера")
-            return
-        ok = update_key_host(key_id, new_host)
-        if ok:
-            await message.answer("✅ Сервер обновлён")
-        else:
-            await message.answer("❌ Не удалось обновить сервер")
-        await state.clear()
 
-    # --- Начисление реф. баланса: удалено ---
-
-    # --- Выдача подарочного ключа ---
     class AdminGiftKey(StatesGroup):
         picking_user = State()
         picking_host = State()
@@ -1200,7 +2117,7 @@ def get_admin_router() -> Router:
             reply_markup=keyboards.create_admin_users_pick_keyboard(users, page=0, action="gift")
         )
 
-    # Запуск выдачи подарка сразу для выбранного пользователя из карточки пользователя
+
     @admin_router.callback_query(F.data.startswith("admin_gift_key_"))
     async def admin_gift_key_for_user(callback: types.CallbackQuery, state: FSMContext):
         if not is_admin(callback.from_user.id):
@@ -1312,7 +2229,7 @@ def get_admin_router() -> Router:
         if days <= 0:
             await message.answer("❌ Срок должен быть положительным")
             return
-        # Сгенерируем уникальный техн. email
+
         user = get_user(user_id) or {}
         username = (user.get('username') or f'user{user_id}').lower()
         username_slug = re.sub(r"[^a-z0-9._-]", "_", username).strip("_")[:16] or f"user{user_id}"
@@ -1321,7 +2238,7 @@ def get_admin_router() -> Router:
         attempt = 1
         while True:
             candidate_email = f"{candidate_local}@bot.local"
-            existing = get_key_by_email(candidate_email)
+            existing = rw_repo.get_key_by_email(candidate_email)
             if not existing:
                 break
             attempt += 1
@@ -1332,7 +2249,7 @@ def get_admin_router() -> Router:
                 break
         generated_email = candidate_email
 
-        # Создаём/обновляем клиента на хосте с days_to_add
+
         try:
             host_resp = await create_or_update_key_on_host(host_name, generated_email, days_to_add=days)
         except Exception as e:
@@ -1340,16 +2257,20 @@ def get_admin_router() -> Router:
             logging.error(f"Gift flow: failed to create client on host '{host_name}' for user {user_id}: {e}")
 
         if not host_resp or not host_resp.get("client_uuid") or not host_resp.get("expiry_timestamp_ms"):
-            await message.answer("❌ Не удалось выдать ключ на сервере. Проверьте настройки хоста и доступность панели XUI.")
+            await message.answer("❌ Не удалось выдать ключ на сервере. Проверьте настройки хоста и доступность панели Remnawave.")
             await state.clear()
             await show_admin_menu(message)
             return
 
         client_uuid = host_resp["client_uuid"]
-        expiry_ms = int(host_resp["expiry_timestamp_ms"])  # в мс
+        expiry_ms = int(host_resp["expiry_timestamp_ms"])
         connection_link = host_resp.get("connection_string")
 
-        key_id = add_new_key(user_id, host_name, client_uuid, generated_email, expiry_ms)
+        key_id = rw_repo.record_key_from_payload(
+            user_id=user_id,
+            payload=host_resp,
+            host_name=host_name,
+        )
         if key_id:
             username_readable = (user.get('username') or '').strip()
             user_part = f"{user_id} (@{username_readable})" if username_readable else f"{user_id}"
@@ -1375,9 +2296,9 @@ def get_admin_router() -> Router:
         await state.clear()
         await show_admin_menu(message)
 
-    # Текстовые обработчики больше не используются в новом потоке выдачи ключа
 
-    # --- Начисление основного баланса ---
+
+
     class AdminMainRefill(StatesGroup):
         waiting_for_pair = State()
         waiting_for_amount = State()
@@ -1412,7 +2333,7 @@ def get_admin_router() -> Router:
             reply_markup=keyboards.create_admin_cancel_keyboard()
         )
 
-    # Пагинация списка пользователей для начисления баланса
+
     @admin_router.callback_query(F.data.startswith("admin_add_balance_pick_user_page_"))
     async def admin_add_balance_pick_user_page(callback: types.CallbackQuery, state: FSMContext):
         if not is_admin(callback.from_user.id):
@@ -1429,7 +2350,7 @@ def get_admin_router() -> Router:
             reply_markup=keyboards.create_admin_users_pick_keyboard(users, page=page, action="add_balance")
         )
 
-    # Выбор пользователя для начисления: дальше админ вводит только сумму
+
     @admin_router.callback_query(F.data.startswith("admin_add_balance_pick_user_"))
     async def admin_add_balance_pick_user(callback: types.CallbackQuery, state: FSMContext):
         if not is_admin(callback.from_user.id):
@@ -1477,7 +2398,7 @@ def get_admin_router() -> Router:
         await state.clear()
         await show_admin_menu(message)
 
-    # Back from key actions to keys list
+
     @admin_router.callback_query(F.data.startswith("admin_key_back_"))
     async def admin_key_back(callback: types.CallbackQuery, state: FSMContext):
         if not is_admin(callback.from_user.id):
@@ -1489,11 +2410,11 @@ def get_admin_router() -> Router:
         except Exception:
             await callback.message.answer("❌ Неверный формат key_id")
             return
-        key = get_key_by_id(key_id)
+        key = rw_repo.get_key_by_id(key_id)
         if not key:
             await callback.message.answer("❌ Ключ не найден")
             return
-        # Если мы находимся в контексте просмотра ключей хоста — вернёмся к списку ключей этого хоста
+
         host_from_state = None
         try:
             data = await state.get_data()
@@ -1516,7 +2437,7 @@ def get_admin_router() -> Router:
                 reply_markup=keyboards.create_admin_user_keys_keyboard(user_id, keys)
             )
 
-    # noop callback to safely ignore placeholder buttons
+
     @admin_router.callback_query(F.data == "noop")
     async def admin_noop(callback: types.CallbackQuery):
         await callback.answer()
@@ -1527,11 +2448,11 @@ def get_admin_router() -> Router:
         await state.clear()
         await show_admin_menu(callback.message, edit_message=True)
 
-    # --- Списание средств администратором (UI) ---
+
     class AdminMainDeduct(StatesGroup):
         waiting_for_amount = State()
 
-    # Вход из админ-меню: показать список пользователей
+
     @admin_router.callback_query(F.data == "admin_deduct_balance")
     async def admin_deduct_balance_entry(callback: types.CallbackQuery, state: FSMContext):
         if not is_admin(callback.from_user.id):
@@ -1544,7 +2465,7 @@ def get_admin_router() -> Router:
             reply_markup=keyboards.create_admin_users_pick_keyboard(users, page=0, action="deduct_balance")
         )
 
-    # Быстрый путь из карточки пользователя
+
     @admin_router.callback_query(F.data.startswith("admin_deduct_balance_"))
     async def admin_deduct_balance_user(callback: types.CallbackQuery, state: FSMContext):
         if not is_admin(callback.from_user.id):
@@ -1563,7 +2484,7 @@ def get_admin_router() -> Router:
             reply_markup=keyboards.create_admin_cancel_keyboard()
         )
 
-    # Пагинация списка пользователей
+
     @admin_router.callback_query(F.data.startswith("admin_deduct_balance_pick_user_page_"))
     async def admin_deduct_balance_pick_user_page(callback: types.CallbackQuery, state: FSMContext):
         if not is_admin(callback.from_user.id):
@@ -1580,7 +2501,7 @@ def get_admin_router() -> Router:
             reply_markup=keyboards.create_admin_users_pick_keyboard(users, page=page, action="deduct_balance")
         )
 
-    # Выбор пользователя -> ввод суммы
+
     @admin_router.callback_query(F.data.startswith("admin_deduct_balance_pick_user_"))
     async def admin_deduct_balance_pick_user(callback: types.CallbackQuery, state: FSMContext):
         if not is_admin(callback.from_user.id):
@@ -1632,7 +2553,7 @@ def get_admin_router() -> Router:
         await state.clear()
         await show_admin_menu(message)
 
-    # --- Просмотр ключей на хосте ---
+
     class AdminHostKeys(StatesGroup):
         picking_host = State()
 
@@ -1657,7 +2578,7 @@ def get_admin_router() -> Router:
             return
         await callback.answer()
         host_name = callback.data.split("admin_hostkeys_pick_host_")[-1]
-        # Сохраняем контекст текущего хоста, чтобы корректно работать с кнопкой "Назад"
+
         try:
             await state.update_data(hostkeys_host=host_name)
         except Exception:
@@ -1668,13 +2589,39 @@ def get_admin_router() -> Router:
             reply_markup=keyboards.create_admin_keys_for_host_keyboard(host_name, keys)
         )
 
+    @admin_router.callback_query(AdminHostKeys.picking_host, F.data.startswith("admin_hostkeys_page_"))
+    async def admin_hostkeys_page(callback: types.CallbackQuery, state: FSMContext):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("У вас нет прав.", show_alert=True)
+            return
+        await callback.answer()
+        try:
+            page = int(callback.data.split("_")[-1])
+        except Exception:
+            page = 0
+        data = await state.get_data()
+        host_name = data.get('hostkeys_host')
+        if not host_name:
+
+            hosts = get_all_hosts()
+            await callback.message.edit_text(
+                "🌍 Выберите хост для просмотра ключей:",
+                reply_markup=keyboards.create_admin_hosts_pick_keyboard(hosts, action="hostkeys")
+            )
+            return
+        keys = get_keys_for_host(host_name)
+        await callback.message.edit_text(
+            f"🔑 Ключи на хосте {host_name}:",
+            reply_markup=keyboards.create_admin_keys_for_host_keyboard(host_name, keys, page=page)
+        )
+
     @admin_router.callback_query(AdminHostKeys.picking_host, F.data == "admin_hostkeys_back_to_hosts")
     async def admin_hostkeys_back_to_hosts(callback: types.CallbackQuery, state: FSMContext):
         if not is_admin(callback.from_user.id):
             await callback.answer("У вас нет прав.", show_alert=True)
             return
         await callback.answer()
-        # Сбрасываем контекст выбранного хоста
+
         try:
             await state.update_data(hostkeys_host=None)
         except Exception:
@@ -1693,7 +2640,7 @@ def get_admin_router() -> Router:
         await callback.answer()
         await show_admin_menu(callback.message, edit_message=True)
 
-    # --- Быстрое удаление ключа по ID/Email ---
+
     class AdminQuickDeleteKey(StatesGroup):
         waiting_for_identifier = State()
 
@@ -1715,13 +2662,13 @@ def get_admin_router() -> Router:
             return
         text = (message.text or '').strip()
         key = None
-        # сначала попробуем как ID
+
         try:
             key_id = int(text)
-            key = get_key_by_id(key_id)
+            key = rw_repo.get_key_by_id(key_id)
         except Exception:
-            # затем как email
-            key = get_key_by_email(text)
+
+            key = rw_repo.get_key_by_email(text)
         if not key:
             await message.answer("❌ Ключ не найден. Пришлите корректный key_id или email.")
             return
@@ -1734,7 +2681,7 @@ def get_admin_router() -> Router:
             reply_markup=keyboards.create_admin_delete_key_confirm_keyboard(key_id)
         )
 
-    # --- Продление ключа на N дней ---
+
     class AdminExtendKey(StatesGroup):
         waiting_for_pair = State()
 
@@ -1767,7 +2714,7 @@ def get_admin_router() -> Router:
         if days <= 0:
             await message.answer("❌ Количество дней должно быть положительным")
             return
-        key = get_key_by_id(key_id)
+        key = rw_repo.get_key_by_id(key_id)
         if not key:
             await message.answer("❌ Ключ не найден")
             return
@@ -1776,23 +2723,26 @@ def get_admin_router() -> Router:
         if not host or not email:
             await message.answer("❌ У ключа отсутствуют данные о хосте или email")
             return
-        # Обновим на хосте
+
         resp = None
         try:
             resp = await create_or_update_key_on_host(host, email, days_to_add=days)
         except Exception as e:
-            logger.error(f"Extend flow: failed to update client on host '{host}' for key #{key_id}: {e}")
+            logger.error(f"Поток продления: не удалось обновить клиента на хосте '{host}' для ключа #{key_id}: {e}")
         if not resp or not resp.get('client_uuid') or not resp.get('expiry_timestamp_ms'):
             await message.answer("❌ Не удалось продлить ключ на сервере")
             return
-        # Обновим в БД
-        try:
-            update_key_info(key_id, resp['client_uuid'], int(resp['expiry_timestamp_ms']))
-        except Exception as e:
-            logger.error(f"Extend flow: failed update DB for key #{key_id}: {e}")
+
+        if not rw_repo.update_key(
+            key_id,
+            remnawave_user_uuid=resp['client_uuid'],
+            expire_at_ms=int(resp['expiry_timestamp_ms']),
+        ):
+            await message.answer("❌ Не удалось обновить информацию о ключе.")
+            return
         await state.clear()
         await message.answer(f"✅ Ключ #{key_id} продлён на {days} дн.")
-        # Попробуем уведомить пользователя
+
         try:
             await message.bot.send_message(int(key.get('user_id')), f"ℹ️ Администратор продлил ваш ключ #{key_id} на {days} дн.")
         except Exception:
@@ -1814,7 +2764,7 @@ def get_admin_router() -> Router:
 
     @admin_router.message(Broadcast.waiting_for_message)
     async def broadcast_message_received_handler(message: types.Message, state: FSMContext):
-        # сохраняем оригинальное сообщение целиком, чтобы потом скопировать
+
         await state.update_data(message_to_send=message.model_dump_json())
         await message.answer(
             "Сообщение получено. Хотите добавить к нему кнопку со ссылкой?",
@@ -1843,7 +2793,7 @@ def get_admin_router() -> Router:
     @admin_router.message(Broadcast.waiting_for_button_url)
     async def button_url_received_handler(message: types.Message, state: FSMContext, bot: Bot):
         url_to_check = message.text
-        # Простая проверка схемы. Дальнейшую валидацию можно расширить при необходимости.
+
         if not (url_to_check.startswith("http://") or url_to_check.startswith("https://")):
             await message.answer(
                 "❌ Ссылка должна начинаться с http:// или https://. Попробуйте еще раз.")
@@ -1905,7 +2855,7 @@ def get_admin_router() -> Router:
         await state.clear()
 
         users = get_all_users()
-        logger.info(f"Broadcast: Starting to iterate over {len(users)} users.")
+        logger.info(f"Рассылка: Начинаем итерацию по {len(users)} пользователям.")
 
         sent_count = 0
         failed_count = 0
@@ -1927,7 +2877,7 @@ def get_admin_router() -> Router:
                 await asyncio.sleep(0.1)
             except Exception as e:
                 failed_count += 1
-                logger.warning(f"Failed to send broadcast message to user {user_id}: {e}")
+                logger.warning(f"Не удалось отправить сообщение рассылки пользователю {user_id}: {e}")
 
         await callback.message.answer(
             f"✅ Рассылка завершена!\n\n"
@@ -1943,7 +2893,7 @@ def get_admin_router() -> Router:
         await state.clear()
         await show_admin_menu(callback.message, edit_message=True)
 
-    # --- Админ-команды для управления заявками на вывод ---
+
     @admin_router.message(Command(commands=["approve_withdraw"]))
     async def approve_withdraw_handler(message: types.Message):
         if not is_admin(message.from_user.id):
@@ -1979,4 +2929,582 @@ def get_admin_router() -> Router:
         except Exception as e:
             await message.answer(f"Ошибка: {e}")
 
+
+    @admin_router.callback_query(F.data == "admin_monitor")
+    async def admin_monitor_menu(callback: types.CallbackQuery):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("Доступ только для админов", show_alert=True)
+            return
+        try:
+            hosts = get_all_hosts() or []
+            targets = get_all_ssh_targets() or []
+        except Exception:
+            hosts, targets = [], []
+        kb = InlineKeyboardBuilder()
+        kb.button(text="📟 Панель (локально)", callback_data="admin_monitor_local")
+        for h in hosts:
+            name = h.get('host_name')
+            if name:
+                kb.button(text=f"🖥 {name}", callback_data=f"rmh:{name}")
+        for t in targets:
+            tname = t.get('target_name')
+            if not tname:
+                continue
+            try:
+                digest = hashlib.sha1((tname or '').encode('utf-8','ignore')).hexdigest()
+            except Exception:
+                digest = hashlib.sha1(str(tname).encode('utf-8','ignore')).hexdigest()
+            kb.button(text=f"🔌 {tname}", callback_data=f"rmt:{digest}")
+        kb.button(text="⬅️ В админ-меню", callback_data="admin_menu")
+        rows = [1]
+        total_items = len(hosts) + len(targets)
+        if total_items > 0:
+            rows.extend([2] * ((total_items + 1) // 2))
+        rows.append(1)
+        kb.adjust(*rows)
+        await callback.message.edit_text("<b>Мониторинг ресурсов</b>\nВыберите объект:", reply_markup=kb.as_markup())
+
+    @admin_router.callback_query(F.data == "admin_monitor_local")
+    async def admin_monitor_local(callback: types.CallbackQuery):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("Доступ только для админов", show_alert=True)
+            return
+        
+        await callback.answer("🔄 Получение данных...")
+        
+
+        try:
+            hosts = get_all_hosts() or []
+            if hosts and len(hosts) > 0:
+
+                current_host = hosts[0]
+                data = resource_monitor.get_remote_metrics_for_host(current_host.get('host_name'))
+                is_remote = True
+            else:
+
+                data = resource_monitor.get_local_metrics()
+                is_remote = False
+        except Exception:
+
+            data = resource_monitor.get_local_metrics()
+            is_remote = False
+        
+        try:
+            if is_remote:
+
+                cpu_p = data.get('cpu_percent')
+                mem_p = data.get('memory_percent')
+                disk_p = data.get('disk_percent')
+                load1 = (data.get('loadavg') or [None])[0] if data.get('loadavg') else None
+                net_sent = data.get('network_sent', 0)
+                net_recv = data.get('network_recv', 0)
+                scope = 'host'
+                name = current_host.get('host_name')
+            else:
+
+                cpu_p = (data.get('cpu') or {}).get('percent')
+                mem_p = (data.get('memory') or {}).get('percent')
+                disks = data.get('disks') or []
+                disk_p = max((d.get('percent') or 0) for d in disks) if disks else None
+                load1 = (data.get('cpu') or {}).get('loadavg',[None])[0] if (data.get('cpu') or {}).get('loadavg') else None
+                net_sent = (data.get('net') or {}).get('bytes_sent', 0)
+                net_recv = (data.get('net') or {}).get('bytes_recv', 0)
+                scope = 'local'
+                name = 'panel'
+            
+            rw_repo.insert_resource_metric(
+                scope, name,
+                cpu_percent=cpu_p, mem_percent=mem_p, disk_percent=disk_p,
+                load1=load1,
+                net_bytes_sent=net_sent,
+                net_bytes_recv=net_recv,
+                raw_json=json.dumps(data, ensure_ascii=False)
+            )
+        except Exception:
+            pass
+        
+        if not data.get('ok'):
+            host_name = current_host.get('host_name') if is_remote else 'локально'
+            txt = [
+                f"🚨 <b>Панель ({host_name}) - ОШИБКА</b>",
+                "",
+                f"❌ <code>{data.get('error', 'Неизвестная ошибка')}</code>"
+            ]
+        else:
+            if is_remote:
+
+                cpu = {'percent': data.get('cpu_percent', 0), 'count_logical': data.get('cpu_count', '—')}
+                mem = {
+                    'percent': data.get('memory_percent', 0),
+                    'used': (data.get('memory_used_mb', 0)) * 1024 * 1024,
+                    'total': (data.get('memory_total_mb', 0)) * 1024 * 1024
+                }
+                net = {
+                    'bytes_sent': data.get('network_sent', 0),
+                    'bytes_recv': data.get('network_recv', 0),
+                    'packets_sent': data.get('network_packets_sent', 0),
+                    'packets_recv': data.get('network_packets_recv', 0)
+                }
+                sw = {}
+                disks = []
+                hostname = data.get('uname', '—')
+                platform = '—'
+            else:
+
+                cpu = data.get('cpu') or {}
+                mem = data.get('memory') or {}
+                sw = data.get('swap') or {}
+                net = data.get('net') or {}
+                disks = data.get('disks', [])
+                hostname = data.get('hostname', '—')
+                platform = data.get('platform', '—')
+            
+
+            cpu_percent = cpu.get('percent', 0) or 0
+            mem_percent = mem.get('percent', 0) or 0
+            disk_percent = disk_p or 0
+            
+            def get_status_emoji(value, warning=70, critical=90):
+                if value >= critical:
+                    return "🔴"
+                elif value >= warning:
+                    return "🟡"
+                else:
+                    return "🟢"
+            
+            def format_bytes(bytes_val):
+                if bytes_val is None:
+                    return "—"
+                for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+                    if bytes_val < 1024.0:
+                        return f"{bytes_val:.1f} {unit}"
+                    bytes_val /= 1024.0
+                return f"{bytes_val:.1f} PB"
+            
+            def format_uptime(seconds):
+                if not seconds:
+                    return "—"
+                days = int(seconds // 86400)
+                hours = int((seconds % 86400) // 3600)
+                minutes = int((seconds % 3600) // 60)
+                if days > 0:
+                    return f"{days}д {hours}ч {minutes}м"
+                elif hours > 0:
+                    return f"{hours}ч {minutes}м"
+                else:
+                    return f"{minutes}м"
+            
+            host_name = current_host.get('host_name') if is_remote else 'локально'
+            txt = [
+                f"🖥️ <b>Панель ({host_name})</b>",
+                "",
+                f"🖥 <b>Хост:</b> <code>{hostname}</code>",
+                f"⏱ <b>Время работы:</b> <code>{format_uptime(data.get('uptime_sec'))}</code>",
+                f"🖥 <b>Платформа:</b> <code>{platform}</code>",
+                "",
+                "📊 <b>Производительность:</b>",
+                f"{get_status_emoji(cpu_percent)} <b>Процессор:</b> {cpu_percent}% ({cpu.get('count_logical', '—')} логич, {cpu.get('count_physical', '—')} физич)",
+                f"{get_status_emoji(mem_percent)} <b>Память:</b> {mem_percent}% ({format_bytes(mem.get('used'))} / {format_bytes(mem.get('total'))})",
+                f"{get_status_emoji(disk_percent)} <b>Диск:</b> {disk_percent}%",
+                f"🔄 <b>Swap:</b> {sw.get('percent', '—')}% ({format_bytes(sw.get('used'))} / {format_bytes(sw.get('total'))})" if sw else "",
+                "",
+                "🌐 <b>Сеть:</b>",
+                f"⬆️ Отправлено: <code>{format_bytes(net.get('bytes_sent', 0))}</code>",
+                f"⬇️ Получено: <code>{format_bytes(net.get('bytes_recv', 0))}</code>",
+            ]
+            
+
+            if disks:
+                txt.append("")
+                txt.append("💾 <b>Диски:</b>")
+                for disk in disks[:3]:
+                    mountpoint = disk.get('mountpoint') or disk.get('device', '—')
+                    percent = disk.get('percent', 0) or 0
+                    used = format_bytes(disk.get('used'))
+                    total = format_bytes(disk.get('total'))
+                    txt.append(f"  {get_status_emoji(percent, 80, 95)} <code>{mountpoint}</code>: {percent}% ({used} / {total})")
+                if len(disks) > 3:
+                    txt.append(f"  ... и еще {len(disks) - 3} дисков")
+        
+
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🔄 Обновить", callback_data="admin_monitor_local")
+        kb.button(text="📊 Полная статистика", callback_data="admin_monitor_detailed")
+        kb.button(text="⬅️ Назад", callback_data="admin_monitor")
+        kb.adjust(2, 1)
+        
+        await callback.message.edit_text("\n".join(txt), parse_mode='HTML', reply_markup=kb.as_markup())
+
+    @admin_router.callback_query(F.data.startswith("rmh:"))
+    async def admin_monitor_host(callback: types.CallbackQuery):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("Доступ только для админов", show_alert=True)
+            return
+        
+        host_name = (callback.data or '').split(':',1)[1]
+        await callback.answer("🔄 Подключение к хосту...")
+        data = resource_monitor.get_remote_metrics_for_host(host_name)
+        
+        try:
+            mem_p = (data.get('memory') or {}).get('percent')
+            disks = data.get('disks') or []
+            disk_p = max((d.get('percent') or 0) for d in disks) if disks else None
+            rw_repo.insert_resource_metric(
+                'host', host_name,
+                mem_percent=mem_p,
+                disk_percent=disk_p,
+                load1=(data.get('loadavg') or [None])[0],
+                raw_json=json.dumps(data, ensure_ascii=False)
+            )
+        except Exception:
+            pass
+        
+        if not data.get('ok'):
+            txt = [
+                f"🖥️ <b>Хост: {host_name}</b>",
+                "",
+                "🚨 <b>ОШИБКА ПОДКЛЮЧЕНИЯ</b>",
+                f"❌ <code>{data.get('error', 'Неизвестная ошибка')}</code>"
+            ]
+        else:
+            mem = data.get('memory') or {}
+            loadavg = data.get('loadavg') or []
+            cpu_count = data.get('cpu_count', 1)
+            
+
+            cpu_percent = None
+            if loadavg and cpu_count:
+                cpu_percent = min((loadavg[0] / cpu_count) * 100, 100)
+            
+            mem_percent = mem.get('percent', 0) or 0
+            disk_percent = max((d.get('percent') or 0) for d in data.get('disks', [])) if data.get('disks') else 0
+            
+            def get_status_emoji(value, warning=70, critical=90):
+                if value is None:
+                    return "⚪"
+                if value >= critical:
+                    return "🔴"
+                elif value >= warning:
+                    return "🟡"
+                else:
+                    return "🟢"
+            
+            def format_uptime(seconds):
+                if not seconds:
+                    return "—"
+                days = int(seconds // 86400)
+                hours = int((seconds % 86400) // 3600)
+                minutes = int((seconds % 3600) // 60)
+                if days > 0:
+                    return f"{days}д {hours}ч {minutes}м"
+                elif hours > 0:
+                    return f"{hours}ч {minutes}м"
+                else:
+                    return f"{minutes}м"
+            
+            def format_loadavg(loads):
+                if not loads:
+                    return "—"
+                return " / ".join(f"{load:.2f}" for load in loads)
+            
+            txt = [
+                f"🖥️ <b>Хост: {host_name}</b>",
+                "",
+                f"🖥 <b>Система:</b> <code>{data.get('uname', '—')}</code>",
+                f"⏱ <b>Время работы:</b> <code>{format_uptime(data.get('uptime_sec'))}</code>",
+                f"🔢 <b>Ядер процессора:</b> <code>{cpu_count}</code>",
+                "",
+                "📊 <b>Производительность:</b>",
+                f"{get_status_emoji(cpu_percent)} <b>Процессор:</b> {cpu_percent:.1f}%" if cpu_percent is not None else "⚪ <b>Процессор:</b> —",
+                f"📈 <b>Средняя загрузка:</b> <code>{format_loadavg(loadavg)}</code>",
+                f"{get_status_emoji(mem_percent)} <b>Память:</b> {mem_percent}% ({mem.get('used_mb', '—')} / {mem.get('total_mb', '—')} МБ)",
+                f"{get_status_emoji(disk_percent)} <b>Диск:</b> {disk_percent}%",
+            ]
+            
+
+            disks = data.get('disks', [])
+            if disks:
+                txt.append("")
+                txt.append("💾 <b>Диски:</b>")
+                for disk in disks[:3]:
+                    device = disk.get('device') or disk.get('mountpoint', '—')
+                    percent = disk.get('percent', 0) or 0
+                    used = disk.get('used', '—')
+                    size = disk.get('size', '—')
+                    txt.append(f"  {get_status_emoji(percent, 80, 95)} <code>{device}</code>: {percent}% ({used} / {size})")
+                if len(disks) > 3:
+                    txt.append(f"  ... и еще {len(disks) - 3} дисков")
+        
+
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🔄 Обновить", callback_data=callback.data)
+        kb.button(text="⬅️ Назад", callback_data="admin_monitor")
+        kb.adjust(2)
+        
+        await callback.message.edit_text("\n".join(txt), parse_mode='HTML', reply_markup=kb.as_markup())
+
+    @admin_router.callback_query(F.data.startswith("rmt:"))
+    async def admin_monitor_target(callback: types.CallbackQuery):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("Доступ только для админов", show_alert=True)
+            return
+        
+
+        try:
+            digest = callback.data.split(':',1)[1]
+        except Exception:
+            digest = ''
+        tname = None
+        try:
+            for t in get_all_ssh_targets() or []:
+                name = t.get('target_name')
+                if not name:
+                    continue
+                try:
+                    h = hashlib.sha1((name or '').encode('utf-8','ignore')).hexdigest()
+                except Exception:
+                    h = hashlib.sha1(str(name).encode('utf-8','ignore')).hexdigest()
+                if h == digest:
+                    tname = name; break
+        except Exception:
+            tname = None
+        if not tname:
+            await callback.answer("Цель не найдена", show_alert=True)
+            return
+        
+        await callback.answer("🔄 Подключение по SSH...")
+        data = resource_monitor.get_remote_metrics_for_target(tname)
+        
+        try:
+            mem_p = (data.get('memory') or {}).get('percent')
+            disks = data.get('disks') or []
+            disk_p = max((d.get('percent') or 0) for d in disks) if disks else None
+            rw_repo.insert_resource_metric(
+                'target', tname,
+                mem_percent=mem_p,
+                disk_percent=disk_p,
+                load1=(data.get('loadavg') or [None])[0],
+                raw_json=json.dumps(data, ensure_ascii=False)
+            )
+        except Exception:
+            pass
+        
+        if not data.get('ok'):
+            txt = [
+                f"🔌 <b>SSH-цель: {tname}</b>",
+                "",
+                "🚨 <b>ОШИБКА ПОДКЛЮЧЕНИЯ</b>",
+                f"❌ <code>{data.get('error', 'Неизвестная ошибка')}</code>"
+            ]
+        else:
+            mem = data.get('memory') or {}
+            loadavg = data.get('loadavg') or []
+            cpu_count = data.get('cpu_count', 1)
+            
+
+            cpu_percent = None
+            if loadavg and cpu_count:
+                cpu_percent = min((loadavg[0] / cpu_count) * 100, 100)
+            
+            mem_percent = mem.get('percent', 0) or 0
+            disk_percent = max((d.get('percent') or 0) for d in data.get('disks', [])) if data.get('disks') else 0
+            
+            def get_status_emoji(value, warning=70, critical=90):
+                if value is None:
+                    return "⚪"
+                if value >= critical:
+                    return "🔴"
+                elif value >= warning:
+                    return "🟡"
+                else:
+                    return "🟢"
+            
+            def format_uptime(seconds):
+                if not seconds:
+                    return "—"
+                days = int(seconds // 86400)
+                hours = int((seconds % 86400) // 3600)
+                minutes = int((seconds % 3600) // 60)
+                if days > 0:
+                    return f"{days}д {hours}ч {minutes}м"
+                elif hours > 0:
+                    return f"{hours}ч {minutes}м"
+                else:
+                    return f"{minutes}м"
+            
+            def format_loadavg(loads):
+                if not loads:
+                    return "—"
+                return " / ".join(f"{load:.2f}" for load in loads)
+            
+            txt = [
+                f"🔌 <b>SSH-цель: {tname}</b>",
+                "",
+                f"🖥 <b>Система:</b> <code>{data.get('uname', '—')}</code>",
+                f"⏱ <b>Время работы:</b> <code>{format_uptime(data.get('uptime_sec'))}</code>",
+                f"🔢 <b>Ядер процессора:</b> <code>{cpu_count}</code>",
+                "",
+                "📊 <b>Производительность:</b>",
+                f"{get_status_emoji(cpu_percent)} <b>Процессор:</b> {cpu_percent:.1f}%" if cpu_percent is not None else "⚪ <b>Процессор:</b> —",
+                f"📈 <b>Средняя загрузка:</b> <code>{format_loadavg(loadavg)}</code>",
+                f"{get_status_emoji(mem_percent)} <b>Память:</b> {mem_percent}% ({mem.get('used_mb', '—')} / {mem.get('total_mb', '—')} МБ)",
+                f"{get_status_emoji(disk_percent)} <b>Диск:</b> {disk_percent}%",
+            ]
+            
+
+            disks = data.get('disks', [])
+            if disks:
+                txt.append("")
+                txt.append("💾 <b>Диски:</b>")
+                for disk in disks[:3]:
+                    device = disk.get('device') or disk.get('mountpoint', '—')
+                    percent = disk.get('percent', 0) or 0
+                    used = disk.get('used', '—')
+                    size = disk.get('size', '—')
+                    txt.append(f"  {get_status_emoji(percent, 80, 95)} <code>{device}</code>: {percent}% ({used} / {size})")
+                if len(disks) > 3:
+                    txt.append(f"  ... и еще {len(disks) - 3} дисков")
+        
+
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🔄 Обновить", callback_data=callback.data)
+        kb.button(text="⬅️ Назад", callback_data="admin_monitor")
+        kb.adjust(2)
+        
+        await callback.message.edit_text("\n".join(txt), parse_mode='HTML', reply_markup=kb.as_markup())
+
+    @admin_router.callback_query(F.data == "admin_monitor_detailed")
+    async def admin_monitor_detailed(callback: types.CallbackQuery):
+        if not is_admin(callback.from_user.id):
+            await callback.answer("Доступ только для админов", show_alert=True)
+            return
+        
+        await callback.answer("🔄 Получение детальной статистики...")
+        data = resource_monitor.get_local_metrics()
+        
+        if not data.get('ok'):
+            txt = [
+                "🚨 <b>Детальная статистика - ОШИБКА</b>",
+                "",
+                f"❌ <code>{data.get('error', 'Неизвестная ошибка')}</code>"
+            ]
+        else:
+            cpu = data.get('cpu') or {}
+            mem = data.get('memory') or {}
+            sw = data.get('swap') or {}
+            net = data.get('net') or {}
+            disks = data.get('disks') or []
+            
+            def format_bytes(bytes_val):
+                if bytes_val is None:
+                    return "—"
+                for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+                    if bytes_val < 1024.0:
+                        return f"{bytes_val:.1f} {unit}"
+                    bytes_val /= 1024.0
+                return f"{bytes_val:.1f} PB"
+            
+            def format_uptime(seconds):
+                if not seconds:
+                    return "—"
+                days = int(seconds // 86400)
+                hours = int((seconds % 86400) // 3600)
+                minutes = int((seconds % 3600) // 60)
+                if days > 0:
+                    return f"{days}д {hours}ч {minutes}м"
+                elif hours > 0:
+                    return f"{hours}ч {minutes}м"
+                else:
+                    return f"{minutes}м"
+            
+            txt = [
+                "📊 <b>Детальная статистика панели</b>",
+                "",
+                "🖥️ <b>Системная информация:</b>",
+                f"• <b>Хост:</b> <code>{data.get('hostname', '—')}</code>",
+                f"• <b>Платформа:</b> <code>{data.get('platform', '—')}</code>",
+                f"• <b>Python:</b> <code>{data.get('python', '—')}</code>",
+                f"• <b>Время работы:</b> <code>{format_uptime(data.get('uptime_sec'))}</code>",
+                "",
+                "⚙️ <b>Процессор:</b>",
+                f"• <b>Загрузка:</b> {cpu.get('percent', '—')}%",
+                f"• <b>Логических ядер:</b> {cpu.get('count_logical', '—')}",
+                f"• <b>Физических ядер:</b> {cpu.get('count_physical', '—')}",
+                f"• <b>Средняя загрузка:</b> {', '.join(map(str, cpu.get('loadavg', []))) or '—'}",
+                "",
+                "🧠 <b>Память:</b>",
+                f"• <b>Загрузка памяти:</b> {mem.get('percent', '—')}%",
+                f"• <b>Использовано:</b> {format_bytes(mem.get('used'))}",
+                f"• <b>Доступно:</b> {format_bytes(mem.get('available'))}",
+                f"• <b>Всего:</b> {format_bytes(mem.get('total'))}",
+                f"• <b>Загрузка swap:</b> {sw.get('percent', '—')}%",
+                f"• <b>Swap использовано:</b> {format_bytes(sw.get('used'))}",
+                f"• <b>Swap всего:</b> {format_bytes(sw.get('total'))}",
+                "",
+                "🌐 <b>Сеть:</b>",
+                f"• <b>Отправлено:</b> {format_bytes(net.get('bytes_sent'))} ({net.get('packets_sent', 0):,} пакетов)",
+                f"• <b>Получено:</b> {format_bytes(net.get('bytes_recv'))} ({net.get('packets_recv', 0):,} пакетов)",
+                f"• <b>Ошибки входящие:</b> {net.get('errin', 0):,}",
+                f"• <b>Ошибки исходящие:</b> {net.get('errout', 0):,}",
+                f"• <b>Потеряно входящих:</b> {net.get('dropin', 0):,}",
+                f"• <b>Потеряно исходящих:</b> {net.get('dropout', 0):,}",
+            ]
+            
+
+            temps = data.get('temperatures', {})
+            if temps:
+                txt.append("")
+                txt.append("🌡️ <b>Температура:</b>")
+                for sensor_name, temp_info in temps.items():
+                    current = temp_info.get('current', 0)
+                    high = temp_info.get('high', 0)
+                    critical = temp_info.get('critical', 0)
+                    status_emoji = "🔴" if current >= critical else "🟡" if current >= high else "🟢"
+                    txt.append(f"• {status_emoji} <b>{sensor_name}:</b> {current:.1f}°C (критично: {critical:.1f}°C)")
+            
+
+            top_processes = data.get('top_processes', [])
+            if top_processes:
+                txt.append("")
+                txt.append("🔄 <b>Топ процессов по процессору:</b>")
+                for i, proc in enumerate(top_processes[:5], 1):
+                    name = proc.get('name', '—')
+                    cpu_p = proc.get('cpu_percent', 0)
+                    mem_p = proc.get('memory_percent', 0)
+                    pid = proc.get('pid', '—')
+                    txt.append(f"  {i}. <code>{name}</code> (PID: {pid})")
+                    txt.append(f"     Процессор: {cpu_p:.1f}%, Память: {mem_p:.1f}%")
+            
+
+            if disks:
+                txt.append("")
+                txt.append("💾 <b>Диски:</b>")
+                for i, disk in enumerate(disks, 1):
+                    mountpoint = disk.get('mountpoint') or disk.get('device', '—')
+                    fstype = disk.get('fstype', '—')
+                    percent = disk.get('percent', 0) or 0
+                    used = format_bytes(disk.get('used'))
+                    free = format_bytes(disk.get('free'))
+                    total = format_bytes(disk.get('total'))
+                    
+                    status_emoji = "🔴" if percent >= 95 else "🟡" if percent >= 80 else "🟢"
+                    
+                    txt.append(f"  {i}. {status_emoji} <code>{mountpoint}</code>")
+                    txt.append(f"     Тип: {fstype}")
+                    txt.append(f"     Использовано: {percent}% ({used} / {total})")
+                    txt.append(f"     Свободно: {free}")
+                    if i < len(disks):
+                        txt.append("")
+        
+
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🔄 Обновить", callback_data="admin_monitor_detailed")
+        kb.button(text="⬅️ К мониторингу", callback_data="admin_monitor")
+        kb.adjust(2)
+        
+        await callback.message.edit_text("\n".join(txt), parse_mode='HTML', reply_markup=kb.as_markup())
+
     return admin_router
+
+
+

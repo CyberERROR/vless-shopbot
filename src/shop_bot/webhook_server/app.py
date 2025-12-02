@@ -8,38 +8,53 @@ import base64
 import time
 import uuid
 from hmac import compare_digest
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from functools import wraps
 from math import ceil
 from flask import Flask, request, render_template, redirect, url_for, flash, session, current_app, jsonify, send_file
 from flask_wtf.csrf import CSRFProtect, generate_csrf
 import secrets
+import urllib.parse
+import urllib.request
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
-from shop_bot.modules import xui_api
+from shop_bot.modules import remnawave_api
 from shop_bot.bot import handlers
 from shop_bot.bot import keyboards
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from shop_bot.support_bot_controller import SupportBotController
 from shop_bot.data_manager import speedtest_runner
+from shop_bot.data_manager import resource_monitor
 from shop_bot.data_manager import backup_manager
-from shop_bot.data_manager.database import (
+from shop_bot.data_manager import remnawave_repository as rw_repo
+from shop_bot.data_manager.remnawave_repository import (
     get_all_settings, update_setting, get_all_hosts, get_plans_for_host,
     create_host, delete_host, create_plan, delete_plan, update_plan, get_user_count,
     get_total_keys_count, get_total_spent_sum, get_daily_stats_for_charts,
     get_recent_transactions, get_paginated_transactions, get_all_users, get_user_keys,
     ban_user, unban_user, delete_user_keys, get_setting, find_and_complete_ton_transaction,
+    find_and_complete_pending_transaction,
     get_tickets_paginated, get_open_tickets_count, get_ticket, get_ticket_messages,
     add_support_message, set_ticket_status, delete_ticket,
     get_closed_tickets_count, get_all_tickets_count, update_host_subscription_url,
     update_host_url, update_host_name, update_host_ssh_settings, get_latest_speedtest, get_speedtests,
-    get_all_keys, get_keys_for_user, get_key_by_id, delete_key_by_id, update_key_comment, update_key_info,
-    add_new_key, get_balance, adjust_user_balance, get_referrals_for_user,
-    get_user, get_key_by_email
+    get_all_keys, get_keys_for_user, delete_key_by_id, update_key_comment,
+    get_balance, adjust_user_balance, get_referrals_for_user,
+
+    get_users_paginated, get_keys_counts_for_users,
+
+    get_all_ssh_targets, get_ssh_target, create_ssh_target, update_ssh_target_fields, delete_ssh_target,
+    get_user
 )
+from shop_bot.data_manager.database import (
+    get_button_configs, create_button_config, update_button_config, 
+    delete_button_config, reorder_button_configs, DB_FILE
+)
+from shop_bot.data_manager.database import update_host_remnawave_settings, get_plan_by_id
+import sqlite3
 
 _bot_controller = None
 _support_bot_controller = SupportBotController()
@@ -51,16 +66,33 @@ ALL_SETTINGS_KEYS = [
     "yookassa_secret_key", "sbp_enabled", "receipt_email", "cryptobot_token",
     "heleket_merchant_id", "heleket_api_key", "domain", "referral_percentage",
     "referral_discount", "ton_wallet_address", "tonapi_key", "force_subscription", "trial_enabled", "trial_duration_days", "enable_referrals", "minimum_withdrawal",
-    # Реферальные начисления: альтернативный фиксированный бонус
+
     "enable_fixed_referral_bonus", "fixed_referral_bonus_amount",
-    # Тип начисления реферальной системы (без стартового бонуса)
+
     "referral_reward_type", "referral_on_start_referrer_amount",
     "support_forum_chat_id",
     "support_bot_token", "support_bot_username",
-    # UI
+
     "panel_brand_title",
-    # Backups
-    "backup_interval_days"
+
+    "main_menu_text", "howto_intro_text",
+    "howto_android_text", "howto_ios_text", "howto_windows_text", "howto_linux_text",
+
+    "btn_trial_text", "btn_profile_text", "btn_my_keys_text", "btn_buy_key_text", "btn_topup_text",
+    "btn_referral_text", "btn_support_text", "btn_about_text", "btn_speed_text", "btn_howto_text",
+    "btn_admin_text", "btn_back_to_menu_text",
+
+    "backup_interval_days",
+
+    "monitoring_enabled", "monitoring_interval_sec",
+    "monitoring_cpu_threshold", "monitoring_mem_threshold", "monitoring_disk_threshold",
+    "monitoring_alert_cooldown_sec",
+
+    "yoomoney_enabled", "yoomoney_wallet", "yoomoney_secret", "stars_per_rub", "stars_enabled",
+
+    "yoomoney_api_token", "yoomoney_client_id", "yoomoney_client_secret", "yoomoney_redirect_uri",
+    
+    "platega_enabled", "platega_merchant_id", "platega_api_key",
 ]
 
 def create_webhook_app(bot_controller_instance):
@@ -88,18 +120,108 @@ def create_webhook_app(bot_controller_instance):
         static_folder='static'
     )
     
-    # SECRET_KEY из окружения или сгенерированный на лету (без хардкода)
+
     flask_app.config['SECRET_KEY'] = os.getenv('SHOPBOT_SECRET_KEY') or secrets.token_hex(32)
-    from datetime import timedelta
     flask_app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=30)
 
-    # CSRF защита для всех POST форм в панели; вебхуки будут исключены
+
     csrf = CSRFProtect()
     csrf.init_app(flask_app)
 
+
+    def _handle_promo_after_payment(metadata: dict) -> None:
+        try:
+            promo_code = (metadata.get('promo_code') or '').strip()
+        except Exception:
+            promo_code = ''
+        if not promo_code:
+            return
+        try:
+            user_id = int(metadata.get('user_id') or 0)
+        except Exception:
+            user_id = 0
+        try:
+            applied_amount = float(metadata.get('promo_discount') or 0)
+        except Exception:
+            applied_amount = 0.0
+        order_id = metadata.get('payment_id') or metadata.get('transaction_id') or None
+
+        promo_info = None
+        availability_error = None
+        try:
+            promo_info = rw_repo.redeem_promo_code(promo_code, user_id, applied_amount=applied_amount, order_id=order_id)
+        except Exception as e:
+            logger.warning(f"Промо: не удалось активировать код {promo_code}: {e}")
+
+        if promo_info is None:
+            try:
+                _, availability_error = rw_repo.check_promo_code_available(promo_code, user_id)
+            except Exception as e:
+                logger.warning(f"Промо: не удалось повторно проверить доступность для {promo_code}: {e}")
+
+        should_deactivate = False
+        user_limit_reached = False
+        if promo_info:
+            try:
+                limit_total = promo_info.get('usage_limit_total') or 0
+                used_total = promo_info.get('used_total') or 0
+                if limit_total and used_total >= limit_total:
+                    should_deactivate = True
+            except Exception:
+                pass
+            try:
+                limit_user = promo_info.get('usage_limit_per_user') or 0
+                user_used = promo_info.get('user_used_count') or 0
+                if limit_user and user_used >= limit_user:
+                    user_limit_reached = True
+            except Exception:
+                pass
+        else:
+            if availability_error == "total_limit_reached":
+                should_deactivate = True
+            if availability_error == "user_limit_reached":
+                user_limit_reached = True
+
+        deact_ok = False
+        if should_deactivate:
+            try:
+                deact_ok = rw_repo.update_promo_code_status(promo_code, is_active=False)
+            except Exception as e:
+                logger.warning(f"Промо: не удалось деактивировать код {promo_code}: {e}")
+                deact_ok = False
+
+
+        try:
+            bot = _bot_controller.get_bot_instance()
+            loop = current_app.config.get('EVENT_LOOP')
+            try:
+                admin_ids = list(rw_repo.get_admin_ids() or [])
+            except Exception:
+                admin_ids = []
+            if bot and loop and loop.is_running() and admin_ids:
+                if should_deactivate:
+                    status_msg = "Код отключён." if deact_ok else "Не удалось отключить код — проверьте панель."
+                elif user_limit_reached:
+                    status_msg = "Достигнут лимит на пользователя; код остаётся активным для остальных."
+                elif availability_error:
+                    status_msg = f"Статус: {availability_error}."
+                else:
+                    status_msg = "Лимит не достигнут, код остаётся активным."
+                text = (
+                    f"🎟 Промокод {promo_code} использован пользователем {user_id} на скидку {applied_amount:.2f} RUB. "
+                    f"{status_msg}"
+                )
+                for aid in admin_ids:
+                    try:
+                        asyncio.run_coroutine_threadsafe(bot.send_message(int(aid), text), loop)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
     @flask_app.context_processor
     def inject_current_year():
-        # Добавляем csrf_token в шаблоны для meta и скрытых полей
+
         return {
             'current_year': datetime.utcnow().year,
             'csrf_token': generate_csrf
@@ -120,7 +242,7 @@ def create_webhook_app(bot_controller_instance):
             if request.form.get('username') == settings.get("panel_login") and \
                request.form.get('password') == settings.get("panel_password"):
                 session['logged_in'] = True
-                # remember-me: делаем сессию постоянной при установленном чекбоксе
+
                 session.permanent = bool(request.form.get('remember_me'))
                 return redirect(url_for('dashboard_page'))
             else:
@@ -158,7 +280,7 @@ def create_webhook_app(bot_controller_instance):
             "open_tickets_count": open_tickets_count,
             "closed_tickets_count": closed_tickets_count,
             "all_tickets_count": all_tickets_count,
-            "brand_title": settings.get('panel_brand_title') or 'T‑Shift VPN',
+            "brand_title": settings.get('panel_brand_title') or 'Remnawave Control',
         }
 
     @flask_app.route('/brand-title', methods=['POST'])
@@ -182,15 +304,18 @@ def create_webhook_app(bot_controller_instance):
     @login_required
     def dashboard_page():
         hosts = []
+        ssh_targets = []
         try:
             hosts = get_all_hosts()
-            for h in hosts:
-                try:
-                    h['latest_speedtest'] = get_latest_speedtest(h['host_name'])
-                except Exception:
-                    h['latest_speedtest'] = None
+            ssh_targets = get_all_ssh_targets()
         except Exception:
             hosts = []
+            ssh_targets = []
+        for h in hosts:
+            try:
+                h['latest_speedtest'] = get_latest_speedtest(h['host_name'])
+            except Exception:
+                h['latest_speedtest'] = None
         stats = {
             "user_count": get_user_count(),
             "total_keys": get_total_keys_count(),
@@ -209,12 +334,13 @@ def create_webhook_app(bot_controller_instance):
         
         return render_template(
             'dashboard.html',
+            hosts=hosts,
+            ssh_targets=ssh_targets,
             stats=stats,
             chart_data=chart_data,
             transactions=transactions,
             current_page=page,
             total_pages=total_pages,
-            hosts=hosts,
             **common_data
         )
 
@@ -227,7 +353,7 @@ def create_webhook_app(bot_controller_instance):
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)}), 500
 
-    # Partials for dashboard fragments (auto-update without reload)
+
     @flask_app.route('/dashboard/stats.partial')
     @login_required
     def dashboard_stats_partial():
@@ -254,7 +380,64 @@ def create_webhook_app(bot_controller_instance):
         data = get_daily_stats_for_charts(days=30)
         return jsonify(data)
 
-    # --- Support partials ---
+
+    @flask_app.route('/monitor')
+    @login_required
+    def monitor_page():
+        hosts = []
+        ssh_targets = []
+        try:
+            hosts = get_all_hosts()
+            ssh_targets = get_all_ssh_targets()
+        except Exception:
+            hosts = []
+            ssh_targets = []
+        common_data = get_common_template_data()
+        return render_template('monitor.html', hosts=hosts, ssh_targets=ssh_targets, **common_data)
+
+    @flask_app.route('/monitor/local.json')
+    @login_required
+    def monitor_local_json():
+        try:
+            data = resource_monitor.get_local_metrics()
+        except Exception as e:
+            data = {"ok": False, "error": str(e)}
+        return jsonify(data)
+
+    @flask_app.route('/monitor/host/<host_name>.json')
+    @login_required
+    def monitor_host_json(host_name: str):
+        try:
+            data = resource_monitor.get_remote_metrics_for_host(host_name)
+        except Exception as e:
+            data = {"ok": False, "error": str(e)}
+        return jsonify(data)
+
+    @flask_app.route('/monitor/target/<target_name>.json')
+    @login_required
+    def monitor_target_json(target_name: str):
+        try:
+            data = resource_monitor.get_remote_metrics_for_target(target_name)
+        except Exception as e:
+            data = {"ok": False, "error": str(e)}
+        return jsonify(data)
+
+
+    @flask_app.route('/monitor/series/<scope>/<name>.json')
+    @login_required
+    def monitor_series_json(scope: str, name: str):
+        try:
+            hours = int(request.args.get('hours', '24') or '24')
+        except Exception:
+            hours = 24
+        
+        try:
+            series = rw_repo.get_metrics_series(scope, name, since_hours=hours, limit=1000)
+            return jsonify({"ok": True, "items": series})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+
     @flask_app.route('/support/table.partial')
     @login_required
     def support_table_partial():
@@ -271,7 +454,7 @@ def create_webhook_app(bot_controller_instance):
             count = get_open_tickets_count() or 0
         except Exception:
             count = 0
-        # Возвращаем готовый HTML-бейдж (или пустую строку)
+
         if count and count > 0:
             html = (
                 '<span class="badge bg-green-lt" title="Открытые тикеты">'
@@ -285,35 +468,91 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route('/users')
     @login_required
     def users_page():
-        users = get_all_users()
+
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 25, type=int)
+        q = (request.args.get('q') or '').strip()
+
+
+        users, total = get_users_paginated(page=page, per_page=per_page, q=q or None)
+        user_ids = [u['telegram_id'] for u in users]
+
+
+        try:
+            keys_counts = get_keys_counts_for_users(user_ids)
+        except Exception:
+            keys_counts = {}
+
         for user in users:
             uid = user['telegram_id']
-            user['user_keys'] = get_user_keys(uid)
+
             try:
-                user['balance'] = get_balance(uid)
-                user['referrals'] = get_referrals_for_user(uid)
+
+                user['balance'] = float(user.get('balance') or 0.0)
             except Exception:
                 user['balance'] = 0.0
-                user['referrals'] = []
-        
-        common_data = get_common_template_data()
-        return render_template('users.html', users=users, **common_data)
+            user['keys_count'] = int(keys_counts.get(uid, 0) or 0)
 
-    # Partial: users table tbody
+
+        from math import ceil
+        total_pages = ceil(total / per_page) if per_page else 1
+
+        common_data = get_common_template_data()
+        return render_template('users.html', users=users, current_page=page, total_pages=total_pages, q=q, per_page=per_page, **common_data)
+
+
     @flask_app.route('/users/table.partial')
     @login_required
     def users_table_partial():
-        users = get_all_users()
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 25, type=int)
+        q = (request.args.get('q') or '').strip()
+        users, total = get_users_paginated(page=page, per_page=per_page, q=q or None)
+        user_ids = [u['telegram_id'] for u in users]
+        try:
+            keys_counts = get_keys_counts_for_users(user_ids)
+        except Exception:
+            keys_counts = {}
         for user in users:
             uid = user['telegram_id']
-            user['user_keys'] = get_user_keys(uid)
             try:
-                user['balance'] = get_balance(uid)
-                user['referrals'] = get_referrals_for_user(uid)
+                user['balance'] = float(user.get('balance') or 0.0)
             except Exception:
                 user['balance'] = 0.0
-                user['referrals'] = []
+            user['keys_count'] = int(keys_counts.get(uid, 0) or 0)
         return render_template('partials/users_table.html', users=users)
+
+
+    @flask_app.route('/users/<int:user_id>/keys.partial')
+    @login_required
+    def user_keys_partial(user_id: int):
+        try:
+            keys = get_user_keys(user_id)
+        except Exception:
+            keys = []
+        return render_template('partials/user_keys_table.html', keys=keys)
+
+
+    @flask_app.route('/users/<int:user_id>/referrals.json')
+    @login_required
+    def user_referrals_json(user_id: int):
+        try:
+            refs = get_referrals_for_user(user_id) or []
+            return jsonify({"ok": True, "items": refs, "count": len(refs)})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+
+    @flask_app.route('/users/pagination.partial')
+    @login_required
+    def users_pagination_partial():
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 25, type=int)
+        q = (request.args.get('q') or '').strip()
+        _, total = get_users_paginated(page=page, per_page=per_page, q=q or None)
+        from math import ceil
+        total_pages = ceil(total / per_page) if per_page else 1
+        return render_template('partials/users_pagination.html', current_page=page, total_pages=total_pages, q=q)
 
     @flask_app.route('/users/<int:user_id>/balance/adjust', methods=['POST'])
     @login_required
@@ -321,7 +560,7 @@ def create_webhook_app(bot_controller_instance):
         try:
             delta = float(request.form.get('delta', '0') or '0')
         except ValueError:
-            # AJAX?
+
             wants_json = 'application/json' in (request.headers.get('Accept') or '') or request.headers.get('X-Requested-With') == 'XMLHttpRequest'
             if wants_json:
                 return jsonify({"ok": False, "error": "invalid_amount"}), 400
@@ -335,7 +574,7 @@ def create_webhook_app(bot_controller_instance):
         if wants_json:
             return jsonify({"ok": ok, "message": message})
         flash(message, category)
-        # Telegram-уведомление пользователю (через запущенный цикл событий бота)
+
         try:
             if ok:
                 bot = _bot_controller.get_bot_instance()
@@ -347,7 +586,7 @@ def create_webhook_app(bot_controller_instance):
                         asyncio.run_coroutine_threadsafe(bot.send_message(chat_id=user_id, text=text), loop)
                         logger.info(f"Запланирована отправка уведомления о балансе пользователю {user_id}")
                     else:
-                        # fallback, если по какой-то причине нет общего цикла (не рекомендуется, но лучше чем молча не отправить)
+
                         logger.warning("Цикл событий (EVENT_LOOP) не запущен; использую резервный asyncio.run для уведомления о балансе")
                         asyncio.run(bot.send_message(chat_id=user_id, text=text))
                 else:
@@ -355,6 +594,200 @@ def create_webhook_app(bot_controller_instance):
         except Exception as e:
             logger.warning(f"Не удалось отправить уведомление о балансе: {e}")
         return redirect(url_for('users_page'))
+
+    @flask_app.route('/users/<int:user_id>/details.json')
+    @login_required
+    def user_details_json(user_id: int):
+        """Fetch detailed user information for the details modal"""
+        try:
+            # Get basic user info
+            user = get_user(user_id)
+            if not user:
+                return jsonify({"ok": False, "error": "user_not_found"}), 404
+            
+            # Get referral information
+            referrals = get_referrals_for_user(user_id) or []
+            
+            # Get referred by user info
+            referred_by_user = None
+            if user.get('referred_by'):
+                try:
+                    referred_by_user = get_user(user.get('referred_by'))
+                except Exception:
+                    pass
+            
+            # Get payment history (transactions with status paid/completed/success)
+            payment_history = []
+            try:
+                with sqlite3.connect(DB_FILE) as conn:
+                    conn.row_factory = sqlite3.Row
+                    cursor = conn.cursor()
+                    # First check if there are ANY transactions for this user
+                    cursor.execute("SELECT COUNT(*) FROM transactions WHERE user_id = ?", (user_id,))
+                    total_count = cursor.fetchone()[0]
+                    logger.info(f"Total transactions for user {user_id}: {total_count}")
+                    
+                    cursor.execute("""
+                        SELECT created_date, amount_rub, metadata, status, payment_method
+                        FROM transactions
+                        WHERE user_id = ? 
+                        AND LOWER(COALESCE(status, '')) IN ('paid', 'completed', 'success')
+                        AND (payment_method IS NULL OR LOWER(payment_method) != 'balance')
+                        ORDER BY created_date DESC
+                        LIMIT 50
+                    """, (user_id,))
+                    rows = cursor.fetchall()
+                    logger.info(f"Payment history rows for user {user_id}: {len(rows)}")
+                    
+                    for row in rows:
+                        plan_name = 'N/A'
+                        try:
+                            metadata = json.loads(row['metadata'] or '{}')
+                            plan_name = metadata.get('plan_name', 'N/A')
+                        except Exception:
+                            pass
+                        payment_history.append({
+                            'date': row['created_date'],
+                            'plan': plan_name,
+                            'amount': float(row['amount_rub'] or 0)
+                        })
+            except Exception as e:
+                logger.error(f"Failed to get payment history for user {user_id}: {e}")
+            
+            # Get balance transaction history (all transactions including balance payments)
+            balance_history = []
+            try:
+                with sqlite3.connect(DB_FILE) as conn:
+                    conn.row_factory = sqlite3.Row
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        SELECT created_date, amount_rub, payment_method, status
+                        FROM transactions
+                        WHERE user_id = ?
+                        ORDER BY created_date DESC
+                        LIMIT 50
+                    """, (user_id,))
+                    rows = cursor.fetchall()
+                    logger.info(f"Balance history rows for user {user_id}: {len(rows)}")
+                    
+                    for row in rows:
+                        transaction_type = row['payment_method'] or 'N/A'
+                        if row['payment_method'] == 'balance':
+                            transaction_type = 'Баланс'
+                        balance_history.append({
+                            'date': row['created_date'],
+                            'type': transaction_type,
+                            'amount': float(row['amount_rub'] or 0),
+                            'status': row['status']
+                        })
+            except Exception as e:
+                logger.error(f"Failed to get balance history for user {user_id}: {e}")
+            
+            subscriptions = []
+            subs_stats = {
+                "total": 0,
+                "active": 0,
+                "expired": 0
+            }
+            try:
+                keys = get_keys_for_user(user_id) or []
+                subs_stats["total"] = len(keys)
+                now = datetime.utcnow()
+                
+                for key in keys:
+                    expire_at_str = key.get('expire_at')
+                    is_expired = False
+                    days_left = 0
+                    expire_date_fmt = 'N/A'
+                    
+                    if expire_at_str:
+                        try:
+                            expire_dt = datetime.strptime(str(expire_at_str), "%Y-%m-%d %H:%M:%S")
+                            expire_date_fmt = expire_dt.strftime("%Y-%m-%d %H:%M:%S")
+                            
+                            if expire_dt > now:
+                                delta = expire_dt - now
+                                days_left = delta.days
+                                subs_stats["active"] += 1
+                            else:
+                                is_expired = True
+                                subs_stats["expired"] += 1
+                        except Exception:
+                            pass
+                    else:
+                        subs_stats["active"] += 1
+                        days_left = 9999 # Infinite
+                    
+                    status_text = f"Осталось дней: {days_left}" if not is_expired else "ИСТЕК"
+                    
+                    subscriptions.append({
+                        "key": key.get('subscription_url') or key.get('access_url') or 'N/A',
+                        "status_text": status_text,
+                        "expire_date": expire_date_fmt,
+                        "is_expired": is_expired
+                    })
+                    
+            except Exception as e:
+                logger.error(f"Failed to get subscriptions for user {user_id}: {e}")
+
+            # Prepare response
+            result = {
+                "ok": True,
+                "user": {
+                    "telegram_id": user.get('telegram_id'),
+                    "username": user.get('username'),
+                    "registration_date": user.get('registration_date'),
+                    "balance": float(user.get('balance') or 0),
+                    "total_spent": float(user.get('total_spent') or 0),
+                    "total_months": int(user.get('total_months') or 0),
+                    "trial_used": bool(user.get('trial_used')),
+                    "referral_code": f"ref_{user_id}",
+                    "referral_count": len(referrals),
+                    "referred_by": {
+                        "telegram_id": referred_by_user.get('telegram_id') if referred_by_user else None,
+                        "username": referred_by_user.get('username') if referred_by_user else None
+                    } if referred_by_user else None
+                },
+                "payment_history": payment_history,
+                "balance_history": balance_history,
+                "subscriptions": subscriptions,
+                "subs_stats": subs_stats
+            }
+            
+            return jsonify(result)
+        except Exception as e:
+            logger.error(f"Failed to get user details for {user_id}: {e}")
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @flask_app.route('/users/<int:user_id>/trial/toggle', methods=['POST'])
+    @login_required
+    def toggle_trial_used_route(user_id: int):
+        """Toggle trial_used status for a user"""
+        try:
+            user = get_user(user_id)
+            if not user:
+                return jsonify({"ok": False, "error": "user_not_found"}), 404
+            
+            current_status = bool(user.get('trial_used'))
+            new_status = not current_status
+            
+            # Update trial_used in database
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE users SET trial_used = ? WHERE telegram_id = ?",
+                    (1 if new_status else 0, user_id)
+                )
+                conn.commit()
+            
+            return jsonify({
+                "ok": True,
+                "trial_used": new_status,
+                "message": f"Пробный период {'использован' if new_status else 'не использован'}"
+            })
+        except Exception as e:
+            logger.error(f"Failed to toggle trial for user {user_id}: {e}")
+            return jsonify({"ok": False, "error": str(e)}), 500
 
     @flask_app.route('/admin/keys')
     @login_required
@@ -377,7 +810,7 @@ def create_webhook_app(bot_controller_instance):
         common_data = get_common_template_data()
         return render_template('admin_keys.html', keys=keys, hosts=hosts, users=users, **common_data)
 
-    # Partial: admin keys table tbody
+
     @flask_app.route('/admin/keys/table.partial')
     @login_required
     def admin_keys_table_partial():
@@ -411,41 +844,44 @@ def create_webhook_app(bot_controller_instance):
         try:
             user_id = int(request.form.get('user_id'))
             host_name = (request.form.get('host_name') or '').strip()
-            xui_uuid = (request.form.get('xui_client_uuid') or '').strip()
+            Remnawave_uuid = (request.form.get('Remnawave_client_uuid') or '').strip()
             key_email = (request.form.get('key_email') or '').strip()
             expiry = request.form.get('expiry_date') or ''
-            # ожидаем datetime-local, конвертируем в ms
-            from datetime import datetime
+
             expiry_ms = int(datetime.fromisoformat(expiry).timestamp() * 1000) if expiry else 0
         except Exception:
             flash('Проверьте поля ключа.', 'danger')
             return redirect(request.referrer or url_for('admin_keys_page'))
-        # Если UUID не указан — генерируем автоматически, как при выдаче ключа в боте
-        if not xui_uuid:
-            xui_uuid = str(uuid.uuid4())
-        # 1) Создать/обновить клиента на XUI-хосте
+
+        if not Remnawave_uuid:
+            Remnawave_uuid = str(uuid.uuid4())
+
         result = None
         try:
-            result = asyncio.run(xui_api.create_or_update_key_on_host(host_name, key_email, expiry_timestamp_ms=expiry_ms or None))
+            result = asyncio.run(remnawave_api.create_or_update_key_on_host(host_name, key_email, expiry_timestamp_ms=expiry_ms or None))
         except Exception as e:
             logger.error(f"Не удалось создать/обновить ключ на хосте: {e}")
             result = None
         if not result:
-            flash('Не удалось создать ключ на хосте. Проверьте доступность XUI.', 'danger')
+            flash('Не удалось создать ключ на хосте. Проверьте доступность Remnawave.', 'danger')
             return redirect(request.referrer or url_for('admin_keys_page'))
 
-        # Обновляем UUID и expiry на основании ответа панели
+
         try:
-            xui_uuid = result.get('client_uuid') or xui_uuid
+            Remnawave_uuid = result.get('client_uuid') or Remnawave_uuid
             expiry_ms = result.get('expiry_timestamp_ms') or expiry_ms
         except Exception:
             pass
 
-        # 2) Сохранить в БД
-        new_id = add_new_key(user_id, host_name, xui_uuid, key_email, expiry_ms or 0)
+
+        new_id = rw_repo.record_key_from_payload(
+            user_id=user_id,
+            payload=result,
+            host_name=host_name,
+        )
         flash(('Ключ добавлен.' if new_id else 'Ошибка при добавлении ключа.'), 'success' if new_id else 'danger')
 
-        # 3) Уведомление пользователю в Telegram (без email, с пометкой, что ключ выдан администратором)
+
         try:
             bot = _bot_controller.get_bot_instance()
             if bot and new_id:
@@ -472,61 +908,167 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route('/admin/keys/create-ajax', methods=['POST'])
     @login_required
     def create_key_ajax_route():
-        try:
-            user_id = int(request.form.get('user_id'))
-            host_name = (request.form.get('host_name') or '').strip()
-            xui_uuid = (request.form.get('xui_client_uuid') or '').strip()
-            key_email = (request.form.get('key_email') or '').strip()
-            expiry = request.form.get('expiry_date') or ''
-            from datetime import datetime
-            expiry_ms = int(datetime.fromisoformat(expiry).timestamp() * 1000) if expiry else 0
-        except Exception as e:
-            return jsonify({"ok": False, "error": f"invalid input: {e}"}), 400
+        """Создание ключа через панель: персонального либо универсального подарочного токена."""
+        mode = (request.form.get('mode') or 'personal').strip()
+        host_name = (request.form.get('host_name') or '').strip()
+        if not host_name:
+            return jsonify({"ok": False, "error": "host_required"}), 400
 
-        if not xui_uuid:
-            xui_uuid = str(uuid.uuid4())
+        comment = (request.form.get('comment') or '').strip()
+        plan_id = request.form.get('plan_id')
+        custom_days_raw = request.form.get('custom_days')
+        expiry_str = (request.form.get('expiry_date') or '').strip()
+        expiry_ms: int | None = None
+        if expiry_str:
+            try:
+                expiry_dt = datetime.fromisoformat(expiry_str)
+                expiry_ms = int(expiry_dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
+            except Exception:
+                return jsonify({"ok": False, "error": "invalid_expiry"}), 400
 
-        try:
-            result = asyncio.run(xui_api.create_or_update_key_on_host(host_name, key_email, expiry_timestamp_ms=expiry_ms or None))
-        except Exception as e:
-            result = None
-            logger.error(f"create_key_ajax_route: ошибка панели/хоста: {e}")
-        if not result:
-            return jsonify({"ok": False, "error": "host_failed"}), 500
+        days_total = 0
+        if plan_id:
+            plan = get_plan_by_id(plan_id)
+            if plan:
+                try:
+                    months = int(plan.get('months') or 0)
+                except Exception:
+                    months = 0
+                days_total += months * 30
+        if custom_days_raw:
+            try:
+                days_total += max(0, int(custom_days_raw))
+            except Exception:
+                pass
 
-        # sync DB
-        new_id = add_new_key(user_id, host_name, result.get('client_uuid') or xui_uuid, key_email, result.get('expiry_timestamp_ms') or expiry_ms or 0)
+        if mode == 'personal':
+            try:
+                user_id = int(request.form.get('user_id'))
+                key_email = (request.form.get('key_email') or '').strip().lower()
+            except Exception as e:
+                logger.error(f"create_key_ajax_route: неверные параметры персонального режима: {e}")
+                return jsonify({"ok": False, "error": "bad_request"}), 400
+            if not key_email:
+                return jsonify({"ok": False, "error": "email_required"}), 400
+            target_user = get_user(user_id)
+            if not target_user:
+                return jsonify({"ok": False, "error": "user_not_found"}), 404
 
-        # notify user (без email, с пометкой про администратора)
-        try:
-            bot = _bot_controller.get_bot_instance()
-            if bot and new_id:
-                text = (
-                    '🔐 Ваш ключ готов!\n'
-                    f'Сервер: {host_name}\n'
-                    'Выдан администратором через панель.\n'
-                )
-                if result and result.get('connection_string'):
-                    cs = html_escape.escape(result['connection_string'])
-                    text += f"\nПодключение:\n<pre><code>{cs}</code></pre>"
-                loop = current_app.config.get('EVENT_LOOP')
-                if loop and loop.is_running():
-                    asyncio.run_coroutine_threadsafe(
-                        bot.send_message(chat_id=user_id, text=text, parse_mode='HTML', disable_web_page_preview=True),
-                        loop
+            if expiry_ms is None and days_total > 0:
+                expiry_ms = int((datetime.utcnow() + timedelta(days=days_total)).replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+            try:
+                result = asyncio.run(remnawave_api.create_or_update_key_on_host(
+                    host_name,
+                    key_email,
+                    expiry_timestamp_ms=expiry_ms or None,
+                ))
+            except Exception as e:
+                result = None
+                logger.error(f"create_key_ajax_route: ошибка панели/хоста: {e}")
+            if not result:
+                return jsonify({"ok": False, "error": "host_failed"}), 500
+
+            key_id = rw_repo.record_key_from_payload(
+                user_id=user_id,
+                payload=result,
+                host_name=host_name,
+                description=comment,
+            )
+            if not key_id:
+                return jsonify({"ok": False, "error": "db_failed"}), 500
+
+
+            try:
+                bot = _bot_controller.get_bot_instance()
+                if bot and key_id:
+                    text = (
+                        '🔐 Ваш ключ готов!\n'
+                        f'Сервер: {host_name}\n'
+                        'Выдан администратором через панель.\n'
                     )
-                else:
-                    asyncio.run(bot.send_message(chat_id=user_id, text=text, parse_mode='HTML', disable_web_page_preview=True))
-        except Exception as e:
-            logger.warning(f"Не удалось уведомить пользователя (ajax): {e}")
+                    if result and result.get('connection_string'):
+                        cs = html_escape.escape(result['connection_string'])
+                        text += f"\nПодключение:\n<pre><code>{cs}</code></pre>"
+                    loop = current_app.config.get('EVENT_LOOP')
+                    if loop and loop.is_running():
+                        asyncio.run_coroutine_threadsafe(
+                            bot.send_message(chat_id=user_id, text=text, parse_mode='HTML', disable_web_page_preview=True),
+                            loop
+                        )
+                    else:
+                        asyncio.run(bot.send_message(chat_id=user_id, text=text, parse_mode='HTML', disable_web_page_preview=True))
+            except Exception as e:
+                logger.warning(f"Не удалось уведомить пользователя (ajax): {e}")
 
-        return jsonify({
-            "ok": True,
-            "key_id": new_id,
-            "uuid": result.get('client_uuid'),
-            "expiry_ms": result.get('expiry_timestamp_ms'),
-            "connection": result.get('connection_string')
-        })
+            return jsonify({
+                "ok": True,
+                "key_id": key_id,
+                "uuid": result.get('client_uuid'),
+                "expiry_ms": result.get('expiry_timestamp_ms'),
+                "connection": result.get('connection_string')
+            })
+
+        if mode == 'gift':
+
+
+            expiry_ms: int | None = None
+            if expiry_str:
+                try:
+                    expiry_dt = datetime.fromisoformat(expiry_str)
+                    expiry_ms = int(expiry_dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
+                except Exception:
+                    return jsonify({"ok": False, "error": "invalid_expiry"}), 400
+            if expiry_ms is None and days_total > 0:
+                expiry_ms = int((datetime.utcnow() + timedelta(days=days_total)).replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+
+            base_local = f"gift-{uuid.uuid4().hex[:8]}"
+            domain = "bot.local"
+            attempt = 0
+            while True:
+                candidate_email = f"{base_local if attempt == 0 else base_local + '-' + str(attempt)}@{domain}"
+                if not rw_repo.get_key_by_email(candidate_email):
+                    break
+                attempt += 1
+
+
+            try:
+                result = asyncio.run(remnawave_api.create_or_update_key_on_host(
+                    host_name,
+                    candidate_email,
+                    expiry_timestamp_ms=expiry_ms or None,
+                    description=comment or 'Gift key (created via admin panel)',
+                    tag='GIFT',
+                ))
+            except Exception as e:
+                logger.error(f"Создание подарочного ключа: ошибка remnawave: {e}")
+                result = None
+            if not result:
+                return jsonify({"ok": False, "error": "host_failed"}), 500
+
+
+            key_id = rw_repo.record_key_from_payload(
+                user_id=0,
+                payload=result,
+                host_name=host_name,
+                description=comment or 'Gift key',
+            )
+            if not key_id:
+                return jsonify({"ok": False, "error": "db_failed"}), 500
+
+
+            return jsonify({
+                "ok": True,
+                "key_id": key_id,
+                "email": candidate_email,
+                "uuid": result.get('client_uuid'),
+                "expiry_ms": result.get('expiry_timestamp_ms') or expiry_ms,
+                "connection": result.get('connection_string'),
+                "note": "Gift key created (not bound to Telegram user)."
+            })
+
+        return jsonify({"ok": False, "error": "unsupported_mode"}), 400
 
     @flask_app.route('/admin/keys/generate-email')
     @login_required
@@ -545,7 +1087,7 @@ def create_webhook_app(bot_controller_instance):
             attempt = 1
             while True:
                 candidate_email = f"{candidate_local}@bot.local"
-                if not get_key_by_email(candidate_email):
+                if not rw_repo.get_key_by_email(candidate_email):
                     break
                 attempt += 1
                 candidate_local = f"{base_local}-{attempt}"
@@ -556,12 +1098,12 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route('/admin/keys/<int:key_id>/delete', methods=['POST'])
     @login_required
     def delete_key_route(key_id: int):
-        # пытаемся удалить с сервера и из БД
+
         try:
-            key = get_key_by_id(key_id)
+            key = rw_repo.get_key_by_id(key_id)
             if key:
                 try:
-                    asyncio.run(xui_api.delete_client_on_host(key['host_name'], key['key_email']))
+                    asyncio.run(remnawave_api.delete_client_on_host(key['host_name'], key['key_email']))
                 except Exception:
                     pass
         except Exception:
@@ -577,19 +1119,17 @@ def create_webhook_app(bot_controller_instance):
             delta_days = int(request.form.get('delta_days', '0'))
         except Exception:
             return jsonify({"ok": False, "error": "invalid_delta"}), 400
-        key = get_key_by_id(key_id)
+        key = rw_repo.get_key_by_id(key_id)
         if not key:
             return jsonify({"ok": False, "error": "not_found"}), 404
         try:
-            # Текущая дата истечения
+
             cur_expiry = key.get('expiry_date')
-            from datetime import datetime, timedelta
             if isinstance(cur_expiry, str):
                 try:
-                    from datetime import datetime as dt
-                    exp_dt = dt.fromisoformat(cur_expiry)
+                    exp_dt = datetime.fromisoformat(cur_expiry)
                 except Exception:
-                    # fallback: если в БД дата как 'YYYY-MM-DD HH:MM:SS'
+
                     try:
                         exp_dt = datetime.strptime(cur_expiry, '%Y-%m-%d %H:%M:%S')
                     except Exception:
@@ -599,9 +1139,9 @@ def create_webhook_app(bot_controller_instance):
             new_dt = exp_dt + timedelta(days=delta_days)
             new_ms = int(new_dt.timestamp() * 1000)
 
-            # 1) Применяем новый срок на 3xui (чтобы дата в панели совпадала с реальной)
+
             try:
-                result = asyncio.run(xui_api.create_or_update_key_on_host(
+                result = asyncio.run(remnawave_api.create_or_update_key_on_host(
                     host_name=key.get('host_name'),
                     email=key.get('key_email'),
                     expiry_timestamp_ms=new_ms
@@ -609,18 +1149,23 @@ def create_webhook_app(bot_controller_instance):
             except Exception as e:
                 result = None
             if not result or not result.get('expiry_timestamp_ms'):
-                return jsonify({"ok": False, "error": "xui_update_failed"}), 500
+                return jsonify({"ok": False, "error": "remnawave_update_failed"}), 500
 
-            # 2) Сохраняем в БД (обновляем UUID, если изменился, и дату истечения)
-            client_uuid = result.get('client_uuid') or key.get('xui_client_uuid') or ''
-            update_key_info(key_id, client_uuid, int(result.get('expiry_timestamp_ms')))
 
-            # Уведомим пользователя о продлении/сокращении срока
+            client_uuid = result.get('client_uuid') or key.get('remnawave_user_uuid') or ''
+            if not rw_repo.update_key(
+                key_id,
+                remnawave_user_uuid=client_uuid,
+                expire_at_ms=int(result.get('expiry_timestamp_ms') or new_ms),
+                subscription_url=result.get('subscription_url') or result.get('connection_string'),
+            ):
+                return jsonify({"ok": False, "error": "db_update_failed"}), 500
+
+
             try:
                 user_id = key.get('user_id')
                 new_ms_final = int(result.get('expiry_timestamp_ms'))
-                from datetime import datetime as _dt
-                new_dt_local = _dt.fromtimestamp(new_ms_final/1000)
+                new_dt_local = datetime.fromtimestamp(new_ms_final/1000)
                 text = (
                     "🗓️ Срок вашего VPN-ключа изменён администратором.\n"
                     f"Хост: {key.get('host_name')}\n"
@@ -644,7 +1189,6 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route('/admin/keys/sweep-expired', methods=['POST'])
     @login_required
     def sweep_expired_keys_route():
-        from datetime import datetime
         removed = 0
         failed = 0
         now = datetime.utcnow()
@@ -654,30 +1198,53 @@ def create_webhook_app(bot_controller_instance):
             exp_dt = None
             try:
                 if isinstance(exp, str):
-                    try:
-                        from datetime import datetime as dt
-                        exp_dt = dt.fromisoformat(exp)
-                    except Exception:
-                        # fallback: если в БД дата как 'YYYY-MM-DD HH:MM:SS'
+                    s = exp.strip()
+                    if s:
                         try:
-                            exp_dt = datetime.strptime(exp, '%Y-%m-%d %H:%M:%S')
+
+                            exp_dt = datetime.fromisoformat(s)
                         except Exception:
-                            exp_dt = None
+                            try:
+                                exp_dt = datetime.fromisoformat(s.replace('Z', '+00:00'))
+                            except Exception:
+
+                                try:
+                                    exp_dt = datetime.strptime(s, '%Y-%m-%d %H:%M:%S')
+                                except Exception:
+                                    exp_dt = None
                 else:
                     exp_dt = exp
             except Exception:
                 exp_dt = None
+
+            try:
+                if exp_dt is not None and getattr(exp_dt, 'tzinfo', None) is not None:
+                    exp_dt = exp_dt.astimezone(timezone.utc).replace(tzinfo=None)
+            except Exception:
+                pass
             if not exp_dt or exp_dt > now:
                 continue
-            # Истёкший — пробуем удалить на сервере и в БД, уведомляем пользователя
+
             try:
                 try:
-                    asyncio.run(xui_api.delete_client_on_host(k.get('host_name'), k.get('key_email')))
+
+                    host_for_delete = (k.get('host_name') or '').strip()
+                    if not host_for_delete:
+                        try:
+                            sq = (k.get('squad_uuid') or k.get('squadUuid') or '').strip()
+                            if sq:
+                                squad = rw_repo.get_squad(sq)
+                                if squad and squad.get('host_name'):
+                                    host_for_delete = squad.get('host_name')
+                        except Exception:
+                            pass
+                    if host_for_delete:
+                        asyncio.run(remnawave_api.delete_client_on_host(host_for_delete, k.get('key_email')))
                 except Exception:
                     pass
                 delete_key_by_id(k.get('key_id'))
                 removed += 1
-                # Уведомление пользователю о автоудалении
+
                 try:
                     bot = _bot_controller.get_bot_instance()
                     loop = current_app.config.get('EVENT_LOOP')
@@ -705,7 +1272,7 @@ def create_webhook_app(bot_controller_instance):
         flash('Комментарий обновлён.' if ok else 'Не удалось обновить комментарий.', 'success' if ok else 'danger')
         return redirect(request.referrer or url_for('admin_keys_page'))
 
-    # --- Host SSH settings update ---
+
     @flask_app.route('/admin/hosts/ssh/update', methods=['POST'])
     @login_required
     def update_host_ssh_route():
@@ -713,7 +1280,7 @@ def create_webhook_app(bot_controller_instance):
         ssh_host = (request.form.get('ssh_host') or '').strip() or None
         ssh_port_raw = (request.form.get('ssh_port') or '').strip()
         ssh_user = (request.form.get('ssh_user') or '').strip() or None
-        ssh_password = request.form.get('ssh_password')  # allow empty to clear
+        ssh_password = request.form.get('ssh_password')
         ssh_key_path = (request.form.get('ssh_key_path') or '').strip() or None
         ssh_port = None
         try:
@@ -725,21 +1292,80 @@ def create_webhook_app(bot_controller_instance):
         flash('SSH-параметры обновлены.' if ok else 'Не удалось обновить SSH-параметры.', 'success' if ok else 'danger')
         return redirect(request.referrer or url_for('settings_page'))
 
-    # --- Host speedtest run & fetch ---
+
+    @flask_app.route('/admin/ssh-targets/<target_name>/speedtest/run', methods=['POST'])
+    @login_required
+    def run_ssh_target_speedtest_route(target_name: str):
+        logger.info(f"Панель: запущен спидтест для SSH-цели '{target_name}'")
+        try:
+            res = asyncio.run(speedtest_runner.run_and_store_ssh_speedtest_for_target(target_name))
+        except Exception as e:
+            res = {"ok": False, "error": str(e)}
+        if res and res.get('ok'):
+            logger.info(f"Панель: спидтест для SSH-цели '{target_name}' завершён успешно")
+        else:
+            logger.warning(f"Панель: спидтест для SSH-цели '{target_name}' завершился с ошибкой: {res.get('error') if res else 'unknown'}")
+        wants_json = 'application/json' in (request.headers.get('Accept') or '') or request.headers.get('X-Requested-With') == 'XMLHttpRequest'
+        if wants_json:
+            return jsonify(res)
+        flash(('Тест выполнен.' if res and res.get('ok') else f"Ошибка теста: {res.get('error') if res else 'unknown'}"), 'success' if res and res.get('ok') else 'danger')
+        return redirect(request.referrer or url_for('settings_page', tab='hosts'))
+
+
+    @flask_app.route('/admin/ssh-targets/speedtests/run-all', methods=['POST'])
+    @login_required
+    def run_all_ssh_target_speedtests_route():
+        logger.info("Панель: запуск спидтеста ДЛЯ ВСЕХ SSH-целей")
+        try:
+            targets = get_all_ssh_targets()
+        except Exception:
+            targets = []
+        errors = []
+        ok_count = 0
+        total = 0
+        for t in targets or []:
+            name = (t.get('target_name') or '').strip()
+            if not name:
+                continue
+            total += 1
+            try:
+                res = asyncio.run(speedtest_runner.run_and_store_ssh_speedtest_for_target(name))
+                if res and res.get('ok'):
+                    ok_count += 1
+                else:
+                    errors.append(f"{name}: {res.get('error') if res else 'unknown'}")
+            except Exception as e:
+                errors.append(f"{name}: {e}")
+        logger.info(f"Панель: завершён спидтест ДЛЯ ВСЕХ SSH-целей: ок={ok_count}, всего={total}")
+        wants_json = 'application/json' in (request.headers.get('Accept') or '') or request.headers.get('X-Requested-With') == 'XMLHttpRequest'
+        if wants_json:
+            return jsonify({"ok": len(errors) == 0, "done": ok_count, "total": total, "errors": errors})
+        if errors:
+            flash(f"SSH цели: выполнено {ok_count}/{total}. Ошибки: {'; '.join(errors[:3])}{'…' if len(errors) > 3 else ''}", 'warning')
+        else:
+            flash(f"SSH цели: тесты скорости выполнены для всех ({ok_count}/{total})", 'success')
+        return redirect(request.referrer or url_for('dashboard_page'))
+
+
     @flask_app.route('/admin/hosts/<host_name>/speedtest/run', methods=['POST'])
     @login_required
     def run_host_speedtest_route(host_name: str):
         method = (request.form.get('method') or '').strip().lower()
+        logger.info(f"Панель: запущен спидтест для хоста '{host_name}', метод='{method or 'both'}'")
         try:
             if method == 'ssh':
                 res = asyncio.run(speedtest_runner.run_and_store_ssh_speedtest(host_name))
             elif method == 'net':
                 res = asyncio.run(speedtest_runner.run_and_store_net_probe(host_name))
             else:
-                # both
+
                 res = asyncio.run(speedtest_runner.run_both_for_host(host_name))
         except Exception as e:
             res = {'ok': False, 'error': str(e)}
+        if res and res.get('ok'):
+            logger.info(f"Панель: спидтест для хоста '{host_name}' завершён успешно")
+        else:
+            logger.warning(f"Панель: спидтест для хоста '{host_name}' завершился с ошибкой: {res.get('error') if res else 'unknown'}")
         wants_json = 'application/json' in (request.headers.get('Accept') or '') or request.headers.get('X-Requested-With') == 'XMLHttpRequest'
         if wants_json:
             return jsonify(res)
@@ -765,7 +1391,8 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route('/admin/speedtests/run-all', methods=['POST'])
     @login_required
     def run_all_speedtests_route():
-        # Запустить тесты для всех хостов (оба варианта)
+
+        logger.info("Панель: запуск спидтеста ДЛЯ ВСЕХ хостов")
         try:
             hosts = get_all_hosts()
         except Exception:
@@ -784,6 +1411,7 @@ def create_webhook_app(bot_controller_instance):
                     errors.append(f"{name}: {res.get('error') if res else 'unknown'}")
             except Exception as e:
                 errors.append(f"{name}: {e}")
+        logger.info(f"Панель: завершён спидтест ДЛЯ ВСЕХ хостов: ок={ok_count}, всего={len(hosts)}")
 
         wants_json = 'application/json' in (request.headers.get('Accept') or '') or request.headers.get('X-Requested-With') == 'XMLHttpRequest'
         if wants_json:
@@ -794,11 +1422,11 @@ def create_webhook_app(bot_controller_instance):
             flash(f"Тесты скорости выполнены для всех хостов: {ok_count}/{len(hosts)}", 'success')
         return redirect(request.referrer or url_for('dashboard_page'))
 
-    # --- Host speedtest auto-install ---
+
     @flask_app.route('/admin/hosts/<host_name>/speedtest/install', methods=['POST'])
     @login_required
     def auto_install_speedtest_route(host_name: str):
-        # Supports both HTML form and AJAX
+
         try:
             res = asyncio.run(speedtest_runner.auto_install_speedtest_on_host(host_name))
         except Exception as e:
@@ -807,7 +1435,7 @@ def create_webhook_app(bot_controller_instance):
         if wants_json:
             return jsonify({"ok": bool(res.get('ok')), "log": res.get('log')})
         flash(('Установка завершена успешно.' if res.get('ok') else 'Не удалось установить speedtest на хост.') , 'success' if res.get('ok') else 'danger')
-        # Сохраним логи в flash (урезанно)
+
         try:
             log = res.get('log') or ''
             short = '\n'.join((log.splitlines() or [])[-20:])
@@ -944,7 +1572,7 @@ def create_webhook_app(bot_controller_instance):
                             )
                     except Exception as e:
                         logger.warning(f"Открытие тикета: не удалось переоткрыть тему форума для тикета {ticket_id}: {e}")
-                    # Notify user
+
                     try:
                         bot = _support_bot_controller.get_bot_instance()
                         loop = current_app.config.get('EVENT_LOOP')
@@ -1019,6 +1647,7 @@ def create_webhook_app(bot_controller_instance):
             logger.warning(f"Не удалось обработать удаление темы форума для тикета {ticket_id} перед удалением: {e}")
         if delete_ticket(ticket_id):
             flash(f"Тикет #{ticket_id} удалён.", 'success')
+            return redirect(request.referrer or url_for('support_list_page'))
         else:
             flash(f"Не удалось удалить тикет #{ticket_id}.", 'danger')
             return redirect(url_for('support_ticket_page', ticket_id=ticket_id))
@@ -1027,18 +1656,18 @@ def create_webhook_app(bot_controller_instance):
     @login_required
     def settings_page():
         if request.method == 'POST':
-            # Смена пароля панели (если поле не пустое)
+
             if 'panel_password' in request.form and request.form.get('panel_password'):
                 update_setting('panel_password', request.form.get('panel_password'))
 
-            # Обработка чекбоксов, где в форме идёт hidden=false + checkbox=true
-            checkbox_keys = ['force_subscription', 'sbp_enabled', 'trial_enabled', 'enable_referrals', 'enable_fixed_referral_bonus']
+
+            checkbox_keys = ['force_subscription', 'sbp_enabled', 'trial_enabled', 'enable_referrals', 'enable_fixed_referral_bonus', 'stars_enabled', 'yoomoney_enabled', 'monitoring_enabled', 'platega_enabled']
             for checkbox_key in checkbox_keys:
                 values = request.form.getlist(checkbox_key)
                 value = values[-1] if values else 'false'
                 update_setting(checkbox_key, value)
 
-            # Обновление остальных настроек из ALL_SETTINGS_KEYS (кроме panel_password и чекбоксов)
+
             for key in ALL_SETTINGS_KEYS:
                 if key in checkbox_keys or key == 'panel_password':
                     continue
@@ -1054,13 +1683,18 @@ def create_webhook_app(bot_controller_instance):
         hosts = get_all_hosts()
         for host in hosts:
             host['plans'] = get_plans_for_host(host['host_name'])
-            # добавить последний результат спидтеста в карточку
+
             try:
                 host['latest_speedtest'] = get_latest_speedtest(host['host_name'])
             except Exception:
                 host['latest_speedtest'] = None
+
+        try:
+            ssh_targets = get_all_ssh_targets()
+        except Exception:
+            ssh_targets = []
         
-        # Список доступных бэкапов на сервере (zip)
+
         backups = []
         try:
             from pathlib import Path
@@ -1079,9 +1713,93 @@ def create_webhook_app(bot_controller_instance):
             backups = []
 
         common_data = get_common_template_data()
-        return render_template('settings.html', settings=current_settings, hosts=hosts, backups=backups, **common_data)
+        return render_template('settings.html', settings=current_settings, hosts=hosts, ssh_targets=ssh_targets, backups=backups, **common_data)
 
-    # --- DB Backup/Restore ---
+
+    @flask_app.route('/admin/ssh-targets/create', methods=['POST'])
+    @login_required
+    def create_ssh_target_route():
+        name = (request.form.get('target_name') or '').strip()
+        ssh_host = (request.form.get('ssh_host') or '').strip()
+        ssh_port = request.form.get('ssh_port')
+        ssh_user = (request.form.get('ssh_user') or '').strip() or None
+        ssh_password = request.form.get('ssh_password')
+        ssh_key_path = (request.form.get('ssh_key_path') or '').strip() or None
+        description = (request.form.get('description') or '').strip() or None
+        try:
+            ssh_port_val = int(ssh_port) if ssh_port else 22
+        except Exception:
+            ssh_port_val = 22
+        if not name or not ssh_host:
+            flash('Укажите имя цели и SSH хост.', 'warning')
+            return redirect(url_for('settings_page', tab='hosts'))
+        ok = create_ssh_target(
+            target_name=name,
+            ssh_host=ssh_host,
+            ssh_port=ssh_port_val,
+            ssh_user=ssh_user,
+            ssh_password=ssh_password,
+            ssh_key_path=ssh_key_path,
+            description=description,
+        )
+        flash('SSH-цель добавлена.' if ok else 'Не удалось добавить SSH-цель.', 'success' if ok else 'danger')
+        return redirect(url_for('settings_page', tab='hosts'))
+
+    @flask_app.route('/admin/ssh-targets/<target_name>/update', methods=['POST'])
+    @login_required
+    def update_ssh_target_route(target_name: str):
+        ssh_host = (request.form.get('ssh_host') or '').strip() if 'ssh_host' in request.form else None
+        ssh_port_raw = (request.form.get('ssh_port') or '').strip() if 'ssh_port' in request.form else None
+        ssh_user = (request.form.get('ssh_user') or '').strip() if 'ssh_user' in request.form else None
+        ssh_password = request.form.get('ssh_password') if 'ssh_password' in request.form else None
+        ssh_key_path = (request.form.get('ssh_key_path') or '').strip() if 'ssh_key_path' in request.form else None
+        description = (request.form.get('description') or '').strip() if 'description' in request.form else None
+        try:
+            ssh_port = int(ssh_port_raw) if ssh_port_raw else None
+        except Exception:
+            ssh_port = None
+        ok = update_ssh_target_fields(
+            target_name,
+            ssh_host=ssh_host,
+            ssh_port=ssh_port,
+            ssh_user=ssh_user,
+            ssh_password=ssh_password,
+            ssh_key_path=ssh_key_path,
+            description=description,
+        )
+        flash('SSH-цель обновлена.' if ok else 'Не удалось обновить SSH-цель.', 'success' if ok else 'danger')
+        return redirect(request.referrer or url_for('settings_page', tab='hosts'))
+
+    @flask_app.route('/admin/ssh-targets/<target_name>/delete', methods=['POST'])
+    @login_required
+    def delete_ssh_target_route(target_name: str):
+        ok = delete_ssh_target(target_name)
+        flash('SSH-цель удалена.' if ok else 'Не удалось удалить SSH-цель.', 'success' if ok else 'danger')
+        return redirect(url_for('settings_page', tab='hosts'))
+
+    
+
+    @flask_app.route('/admin/ssh-targets/<target_name>/speedtest/install', methods=['POST'])
+    @login_required
+    def auto_install_speedtest_on_target_route(target_name: str):
+        try:
+            res = asyncio.run(speedtest_runner.auto_install_speedtest_on_target(target_name))
+        except Exception as e:
+            res = {'ok': False, 'log': str(e)}
+        wants_json = 'application/json' in (request.headers.get('Accept') or '') or request.headers.get('X-Requested-With') == 'XMLHttpRequest'
+        if wants_json:
+            return jsonify({"ok": bool(res.get('ok')), "log": res.get('log')})
+        flash(('Установка завершена успешно.' if res.get('ok') else 'Не удалось установить speedtest на цель.') , 'success' if res.get('ok') else 'danger')
+        try:
+            log = res.get('log') or ''
+            short = '\n'.join((log.splitlines() or [])[-20:])
+            if short:
+                flash(short, 'secondary')
+        except Exception:
+            pass
+        return redirect(request.referrer or url_for('settings_page', tab='hosts'))
+
+
     @flask_app.route('/admin/db/backup', methods=['POST'])
     @login_required
     def backup_db_route():
@@ -1090,10 +1808,10 @@ def create_webhook_app(bot_controller_instance):
             if not zip_path or not os.path.isfile(zip_path):
                 flash('Не удалось создать бэкап БД.', 'danger')
                 return redirect(request.referrer or url_for('settings_page', tab='panel'))
-            # Отдаём файл на скачивание
+
             return send_file(str(zip_path), as_attachment=True, download_name=os.path.basename(zip_path))
         except Exception as e:
-            logger.error(f"DB backup error: {e}")
+            logger.error(f"Ошибка резервного копирования БД: {e}")
             flash('Ошибка при создании бэкапа.', 'danger')
             return redirect(request.referrer or url_for('settings_page', tab='panel'))
 
@@ -1101,11 +1819,11 @@ def create_webhook_app(bot_controller_instance):
     @login_required
     def restore_db_route():
         try:
-            # Вариант 1: восстановление из имеющегося архива
+
             existing = (request.form.get('existing_backup') or '').strip()
             ok = False
             if existing:
-                # Разрешаем только файлы внутри BACKUPS_DIR
+
                 base = backup_manager.BACKUPS_DIR
                 candidate = (base / existing).resolve()
                 if str(candidate).startswith(str(base.resolve())) and os.path.isfile(candidate):
@@ -1114,7 +1832,7 @@ def create_webhook_app(bot_controller_instance):
                     flash('Выбранный бэкап не найден.', 'danger')
                     return redirect(request.referrer or url_for('settings_page', tab='panel'))
             else:
-                # Вариант 2: загрузка собственного файла
+
                 file = request.files.get('db_file')
                 if not file or file.filename == '':
                     flash('Файл для восстановления не выбран.', 'warning')
@@ -1138,7 +1856,7 @@ def create_webhook_app(bot_controller_instance):
                 flash('Восстановление не удалось. Проверьте файл и повторите.', 'danger')
             return redirect(request.referrer or url_for('settings_page', tab='panel'))
         except Exception as e:
-            logger.error(f"DB restore error: {e}", exc_info=True)
+            logger.error(f"Ошибка восстановления БД: {e}", exc_info=True)
             flash('Ошибка при восстановлении БД.', 'danger')
             return redirect(request.referrer or url_for('settings_page', tab='panel'))
 
@@ -1167,6 +1885,25 @@ def create_webhook_app(bot_controller_instance):
             return redirect(url_for('settings_page', tab='hosts'))
         ok = update_host_url(host_name, new_url)
         flash('URL хоста обновлён.' if ok else 'Не удалось обновить URL хоста.', 'success' if ok else 'danger')
+        return redirect(url_for('settings_page', tab='hosts'))
+
+    @flask_app.route('/update-host-remnawave', methods=['POST'])
+    @login_required
+    def update_host_remnawave_route():
+        host_name = (request.form.get('host_name') or '').strip()
+        base_url = (request.form.get('remnawave_base_url') or '').strip()
+        api_token = (request.form.get('remnawave_api_token') or '').strip()
+        squad_uuid = (request.form.get('squad_uuid') or '').strip()
+        if not host_name:
+            flash('Не указан хост для обновления Remnawave-настроек.', 'danger')
+            return redirect(url_for('settings_page', tab='hosts'))
+        ok = update_host_remnawave_settings(
+            host_name,
+            remnawave_base_url=base_url or None,
+            remnawave_api_token=api_token or None,
+            squad_uuid=squad_uuid or None,
+        )
+        flash('Remnawave-настройки обновлены.' if ok else 'Не удалось обновить Remnawave-настройки.', 'success' if ok else 'danger')
         return redirect(url_for('settings_page', tab='hosts'))
 
     @flask_app.route('/rename-host', methods=['POST'])
@@ -1271,12 +2008,12 @@ def create_webhook_app(bot_controller_instance):
     def ban_user_route(user_id):
         ban_user(user_id)
         flash(f'Пользователь {user_id} был заблокирован.', 'success')
-        # Telegram-уведомление пользователю о бане с кнопкой поддержки (без кнопки "Назад в меню")
+
         try:
             bot = _bot_controller.get_bot_instance()
             if bot:
                 text = "🚫 Ваш аккаунт заблокирован администратором. Если это ошибка — напишите в поддержку."
-                # Собираем клавиатуру из одной кнопки поддержки
+
                 try:
                     support = (get_setting("support_bot_username") or get_setting("support_user") or "").strip()
                 except Exception:
@@ -1284,7 +2021,7 @@ def create_webhook_app(bot_controller_instance):
                 kb = InlineKeyboardBuilder()
                 url: str | None = None
                 if support:
-                    if support.startswith("@"):  # @username
+                    if support.startswith("@"):
                         url = f"tg://resolve?domain={support[1:]}"
                     elif support.startswith("tg://"):
                         url = support
@@ -1318,7 +2055,7 @@ def create_webhook_app(bot_controller_instance):
     def unban_user_route(user_id):
         unban_user(user_id)
         flash(f'Пользователь {user_id} был разблокирован.', 'success')
-        # Telegram-уведомление пользователю о разбане с кнопкой перехода в главное меню
+
         try:
             bot = _bot_controller.get_bot_instance()
             if bot:
@@ -1345,14 +2082,14 @@ def create_webhook_app(bot_controller_instance):
         total = len(keys_to_revoke)
 
         for key in keys_to_revoke:
-            result = asyncio.run(xui_api.delete_client_on_host(key['host_name'], key['key_email']))
+            result = asyncio.run(remnawave_api.delete_client_on_host(key['host_name'], key['key_email']))
             if result:
                 success_count += 1
 
-        # удаляем из БД все ключи пользователя
+
         delete_user_keys(user_id)
 
-        # уведомление пользователю в Telegram
+
         try:
             bot = _bot_controller.get_bot_instance()
             if bot:
@@ -1375,7 +2112,7 @@ def create_webhook_app(bot_controller_instance):
         )
         category = 'success' if success_count == total else 'warning'
 
-        # Если это AJAX-запрос (из таблицы пользователей) — возвращаем JSON
+
         wants_json = 'application/json' in (request.headers.get('Accept') or '') or request.headers.get('X-Requested-With') == 'XMLHttpRequest'
         if wants_json:
             return jsonify({"ok": success_count == total, "message": message, "revoked": success_count, "total": total}), 200
@@ -1386,15 +2123,43 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route('/add-host', methods=['POST'])
     @login_required
     def add_host_route():
-        create_host(
-            name=request.form['host_name'],
-            url=request.form['host_url'],
-            user=request.form['host_username'],
-            passwd=request.form['host_pass'],
-            inbound=int(request.form['host_inbound_id']),
-            subscription_url=(request.form.get('host_subscription_url') or '').strip() or None
-        )
-        flash(f"Хост '{request.form['host_name']}' успешно добавлен.", 'success')
+        name = (request.form.get('host_name') or '').strip()
+        base_url = (request.form.get('remnawave_base_url') or '').strip()
+        api_token = (request.form.get('remnawave_api_token') or '').strip()
+        squad_uuid = (request.form.get('squad_uuid') or '').strip()
+        if not name or not base_url or not api_token:
+            flash('Укажите название хоста, базовый URL и API токен.', 'danger')
+            return redirect(url_for('settings_page', tab='hosts'))
+
+
+        try:
+            create_host(
+                name=name,
+                url=base_url,
+                user='',
+                passwd='',
+                inbound=0,
+                subscription_url=None,
+            )
+        except Exception as e:
+            logger.error(f"Не удалось создать хост '{name}': {e}")
+            flash(f"Не удалось создать хост '{name}'.", 'danger')
+            return redirect(url_for('settings_page', tab='hosts'))
+
+
+        try:
+            update_host_remnawave_settings(
+                name,
+                remnawave_base_url=base_url,
+                remnawave_api_token=api_token,
+                squad_uuid=squad_uuid or None,
+            )
+        except Exception as e:
+            logger.error(f"Не удалось сохранить Remnawave-настройки для '{name}': {e}")
+            flash('Хост создан, но Remnawave-настройки сохранить не удалось.', 'warning')
+            return redirect(url_for('settings_page', tab='hosts'))
+
+        flash(f"Хост '{name}' успешно добавлен.", 'success')
         return redirect(url_for('settings_page', tab='hosts'))
 
     @flask_app.route('/delete-host/<host_name>', methods=['POST'])
@@ -1470,6 +2235,108 @@ def create_webhook_app(bot_controller_instance):
             return 'Error', 500
         
     @csrf.exempt
+    @flask_app.route('/test-webhook', methods=['GET', 'POST'])
+    def test_webhook():
+        """Тестовый endpoint для проверки работы webhook сервера"""
+        if request.method == 'GET':
+            return f"Webhook server is running! Time: {datetime.now()}"
+        else:
+            return f"POST received! Data: {request.get_json() or request.form.to_dict()}"
+    
+    @csrf.exempt
+    @flask_app.route('/debug-all', methods=['GET', 'POST', 'PUT', 'DELETE'])
+    def debug_all_requests():
+        """Endpoint для отладки всех входящих запросов"""
+        print(f"[DEBUG] Received {request.method} request to /debug-all")
+        print(f"[DEBUG] Headers: {dict(request.headers)}")
+        print(f"[DEBUG] Form data: {request.form.to_dict()}")
+        print(f"[DEBUG] JSON data: {request.get_json()}")
+        print(f"[DEBUG] Args: {request.args.to_dict()}")
+        
+        return {
+            "method": request.method,
+            "headers": dict(request.headers),
+            "form": request.form.to_dict(),
+            "json": request.get_json(),
+            "args": request.args.to_dict(),
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    @csrf.exempt
+    @flask_app.route('/yoomoney-webhook', methods=['POST'])
+    def yoomoney_webhook_handler():
+        """ЮMoney HTTP уведомление (кнопка/ссылка p2p). Подпись: sha1(notification_type&operation_id&amount&currency&datetime&sender&codepro&notification_secret&label)."""
+        logger.info("🔔 Получен webhook от ЮMoney")
+        
+        try:
+            form = request.form
+            logger.info(f"📋 Данные webhook: {dict(form)}")
+            
+            required = [
+                'notification_type', 'operation_id', 'amount', 'currency', 'datetime', 'sender', 'codepro', 'label', 'sha1_hash'
+            ]
+            if not all(k in form for k in required):
+                logger.warning(f"❌ Отсутствуют обязательные поля. Доступно: {list(form.keys())}")
+                return 'Bad Request', 400
+            
+
+            notification_type = form.get('notification_type', '')
+            logger.info(f"📝 Тип уведомления: {notification_type}")
+            if notification_type != 'p2p-incoming':
+                logger.info(f"⏭️  Игнорируем тип уведомления: {notification_type}")
+                return 'OK', 200
+            
+
+            codepro = form.get('codepro', '')
+            if codepro.lower() == 'true':
+                logger.info("🧪 Игнорируем тестовый платеж (codepro=true)")
+                return 'OK', 200
+            
+            secret = get_setting('yoomoney_secret') or ''
+            signature_str = "&".join([
+                form.get('notification_type',''),
+                form.get('operation_id',''),
+                form.get('amount',''),
+                form.get('currency',''),
+                form.get('datetime',''),
+                form.get('sender',''),
+                form.get('codepro',''),
+                secret,
+                form.get('label',''),
+            ])
+            expected = hashlib.sha1(signature_str.encode('utf-8')).hexdigest()
+            provided = (form.get('sha1_hash') or '').lower()
+            if expected != provided:
+                logger.warning("🔐 Неверная подпись")
+                return 'Forbidden', 403
+            
+
+            payment_id = form.get('label')
+            if not payment_id:
+                logger.warning("🏷️  Пустой label")
+                return 'OK', 200
+            
+            logger.info(f"💰 Обрабатываем платеж: {payment_id}")
+            metadata = find_and_complete_pending_transaction(payment_id)
+            if not metadata:
+                logger.warning(f"❌ Метаданные не найдены для платежа: {payment_id}")
+                return 'OK', 200
+            
+            logger.info(f"✅ Найдены метаданные для платежа {payment_id}: пользователь={metadata.get('user_id')}, сумма={metadata.get('price')}")
+            bot = _bot_controller.get_bot_instance()
+            loop = current_app.config.get('EVENT_LOOP')
+            payment_processor = handlers.process_successful_payment
+            if bot and loop and loop.is_running():
+                asyncio.run_coroutine_threadsafe(payment_processor(bot, metadata), loop)
+                logger.info(f"🚀 Запущена обработка платежа: {payment_id}")
+            else:
+                logger.error("❌ Бот или цикл событий недоступен")
+            return 'OK', 200
+        except Exception as e:
+            logger.error(f"💥 Ошибка в webhook ЮMoney: {e}", exc_info=True)
+            return 'Error', 500
+
+    @csrf.exempt
     @flask_app.route('/cryptobot-webhook', methods=['POST'])
     def cryptobot_webhook_handler():
         try:
@@ -1500,12 +2367,22 @@ def create_webhook_app(bot_controller_instance):
                     "customer_email": parts[7] if parts[7] != 'None' else None,
                     "payment_method": parts[8]
                 }
+
+                if len(parts) >= 10:
+                    metadata["promo_code"] = (parts[9] if parts[9] != 'None' else None)
+                if len(parts) >= 11:
+                    metadata["promo_discount"] = parts[10]
                 
                 bot = _bot_controller.get_bot_instance()
                 loop = current_app.config.get('EVENT_LOOP')
                 payment_processor = handlers.process_successful_payment
 
                 if bot and loop and loop.is_running():
+
+                    try:
+                        _handle_promo_after_payment(metadata)
+                    except Exception:
+                        pass
                     asyncio.run_coroutine_threadsafe(payment_processor(bot, metadata), loop)
                 else:
                     logger.error("CryptoBot вебхук: не удалось обработать платёж — бот или цикл событий не запущены.")
@@ -1544,6 +2421,11 @@ def create_webhook_app(bot_controller_instance):
                 if not metadata_str: return 'Error', 400
                 
                 metadata = json.loads(metadata_str)
+
+                try:
+                    _handle_promo_after_payment(metadata)
+                except Exception:
+                    pass
                 
                 bot = _bot_controller.get_bot_instance()
                 loop = current_app.config.get('EVENT_LOOP')
@@ -1589,4 +2471,345 @@ def create_webhook_app(bot_controller_instance):
             logger.error(f"Ошибка в обработчике вебхука TonAPI: {e}", exc_info=True)
             return 'Error', 500
 
+    @csrf.exempt
+    @flask_app.route('/platega-webhook', methods=['POST'])
+    def platega_webhook_handler():
+        """Обработчик webhook от Platega"""
+        try:
+            # Проверка заголовков аутентификации
+            merchant_id = request.headers.get('X-MerchantId')
+            secret = request.headers.get('X-Secret')
+            
+            expected_merchant = get_setting('platega_merchant_id')
+            expected_secret = get_setting('platega_api_key')
+            
+            if not expected_merchant or not expected_secret:
+                logger.warning("Platega webhook: настройки не заданы")
+                return 'OK', 200
+            
+            if merchant_id != expected_merchant or secret != expected_secret:
+                logger.warning(f"Platega webhook: неверные учетные данные. Получено: merchant_id={merchant_id}")
+                return 'Forbidden', 403
+            
+            data = request.json
+            logger.info(f"Platega webhook получен: {data}")
+            
+            # Обработка только успешных платежей
+            status = data.get('status')
+            if status == 'CONFIRMED':
+                # Platega отправляет наш payment_id в поле 'payload'
+                payment_id = data.get('payload')
+                
+                if not payment_id:
+                    logger.warning("Platega webhook: отсутствует payload (payment_id)")
+                    return 'OK', 200
+                
+                # Найти метаданные платежа
+                metadata = find_and_complete_pending_transaction(payment_id)
+                if metadata:
+                    logger.info(f"Platega: найдены метаданные для платежа {payment_id}")
+                    
+                    bot = _bot_controller.get_bot_instance()
+                    loop = current_app.config.get('EVENT_LOOP')
+                    payment_processor = handlers.process_successful_payment
+                    
+                    if bot and loop and loop.is_running():
+                        asyncio.run_coroutine_threadsafe(
+                            payment_processor(bot, metadata), 
+                            loop
+                        )
+                        logger.info(f"Platega: платеж {payment_id} обработан")
+                    else:
+                        logger.error("Platega webhook: бот или цикл событий недоступен")
+                else:
+                    logger.warning(f"Platega webhook: метаданные не найдены для платежа {payment_id}")
+            elif status == 'CANCELED':
+                logger.info(f"Platega webhook: платеж отменен, ID={data.get('id')}")
+            else:
+                logger.info(f"Platega webhook: получен статус {status}")
+            
+            return 'OK', 200
+        except Exception as e:
+            logger.error(f"Ошибка в обработчике вебхука Platega: {e}", exc_info=True)
+            return 'Error', 500
+
+
+    def _ym_get_redirect_uri():
+        try:
+            saved = (get_setting("yoomoney_redirect_uri") or "").strip()
+        except Exception:
+            saved = ""
+        if saved:
+            return saved
+        root = request.url_root.rstrip('/')
+        return f"{root}/yoomoney/callback"
+
+    @flask_app.route('/yoomoney/connect')
+    @login_required
+    def yoomoney_connect_route():
+        client_id = (get_setting('yoomoney_client_id') or '').strip()
+        if not client_id:
+            flash('Укажите YooMoney client_id в настройках.', 'warning')
+            return redirect(url_for('settings_page', tab='payments'))
+        redirect_uri = _ym_get_redirect_uri()
+        scope = 'operation-history operation-details account-info'
+        qs = urllib.parse.urlencode({
+            'client_id': client_id,
+            'response_type': 'code',
+            'scope': scope,
+            'redirect_uri': redirect_uri,
+        })
+        url = f"https://yoomoney.ru/oauth/authorize?{qs}"
+        return redirect(url)
+
+    @csrf.exempt
+    @flask_app.route('/yoomoney/callback')
+    def yoomoney_callback_route():
+        code = (request.args.get('code') or '').strip()
+        if not code:
+            flash('YooMoney: не получен code из OAuth.', 'danger')
+            return redirect(url_for('settings_page', tab='payments'))
+        client_id = (get_setting('yoomoney_client_id') or '').strip()
+        client_secret = (get_setting('yoomoney_client_secret') or '').strip()
+        redirect_uri = _ym_get_redirect_uri()
+        data = {
+            'grant_type': 'authorization_code',
+            'code': code,
+            'client_id': client_id,
+            'redirect_uri': redirect_uri,
+        }
+        if client_secret:
+            data['client_secret'] = client_secret
+        try:
+            encoded = urllib.parse.urlencode(data).encode('utf-8')
+            req = urllib.request.Request('https://yoomoney.ru/oauth/token', data=encoded, headers={'Content-Type': 'application/x-www-form-urlencoded'})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                resp_text = resp.read().decode('utf-8', errors='ignore')
+            try:
+                payload = json.loads(resp_text)
+            except Exception:
+                payload = {}
+            token = (payload.get('access_token') or '').strip()
+            if not token:
+                flash(f"Не удалось получить access_token от YooMoney: {payload}", 'danger')
+                return redirect(url_for('settings_page', tab='payments'))
+            update_setting('yoomoney_api_token', token)
+            flash('YooMoney: токен успешно сохранён.', 'success')
+        except Exception as e:
+            logger.error(f"YooMoney OAuth callback error: {e}", exc_info=True)
+            flash(f'Ошибка при обмене кода на токен: {e}', 'danger')
+        return redirect(url_for('settings_page', tab='payments'))
+
+    @flask_app.route('/yoomoney/check', methods=['GET','POST'])
+    @login_required
+    def yoomoney_check_route():
+        token = (get_setting('yoomoney_api_token') or '').strip()
+        if not token:
+            flash('YooMoney: токен не задан.', 'warning')
+            return redirect(url_for('settings_page', tab='payments'))
+
+        try:
+            req = urllib.request.Request('https://yoomoney.ru/api/account-info', headers={'Authorization': f'Bearer {token}'}, method='POST')
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                ai_text = resp.read().decode('utf-8', errors='ignore')
+                ai_status = resp.status
+                ai_headers = dict(resp.headers)
+        except Exception as e:
+            flash(f'YooMoney account-info: ошибка запроса: {e}', 'danger')
+            return redirect(url_for('settings_page', tab='payments'))
+        try:
+            ai = json.loads(ai_text)
+        except Exception:
+            ai = {}
+        if ai_status != 200:
+            www = ai_headers.get('WWW-Authenticate', '')
+            flash(f"YooMoney account-info HTTP {ai_status}. {www}", 'danger')
+            return redirect(url_for('settings_page', tab='payments'))
+        account = ai.get('account') or ai.get('account_number') or '—'
+
+        try:
+            body = urllib.parse.urlencode({'records': '1'}).encode('utf-8')
+            req2 = urllib.request.Request('https://yoomoney.ru/api/operation-history', data=body, headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/x-www-form-urlencoded'})
+            with urllib.request.urlopen(req2, timeout=15) as resp2:
+                oh_text = resp2.read().decode('utf-8', errors='ignore')
+                oh_status = resp2.status
+        except Exception as e:
+            flash(f'YooMoney operation-history: ошибка запроса: {e}', 'warning')
+            oh_status = None
+        if oh_status == 200:
+            flash(f'YooMoney: токен валиден. Кошелёк: {account}', 'success')
+        elif oh_status is not None:
+            flash(f'YooMoney operation-history HTTP {oh_status}. Проверьте scope operation-history и соответствие кошелька.', 'danger')
+        else:
+            flash('YooMoney: не удалось проверить operation-history.', 'warning')
+        return redirect(url_for('settings_page', tab='payments'))
+
+
+    @flask_app.route('/api/button-configs/<menu_type>')
+    @login_required
+    @csrf.exempt
+    def get_button_configs_api(menu_type):
+        """Get button configurations for a specific menu type"""
+        try:
+            configs = get_button_configs(menu_type, include_inactive=True)
+            return jsonify({'success': True, 'data': configs})
+        except Exception as e:
+            logger.error(f"Error getting button configs for {menu_type}: {e}")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    @flask_app.route('/api/button-configs', methods=['POST'])
+    @login_required
+    @csrf.exempt
+    def create_button_config_api():
+        """Create a new button configuration"""
+        try:
+            data = request.json
+            required_fields = ['menu_type', 'button_id', 'text']
+            for field in required_fields:
+                if field not in data:
+                    return jsonify({'success': False, 'error': f'Missing required field: {field}'}), 400
+
+            success = create_button_config(
+                menu_type=data['menu_type'],
+                button_id=data['button_id'],
+                text=data['text'],
+                callback_data=data.get('callback_data'),
+                url=data.get('url'),
+                row_position=data.get('row_position', 0),
+                column_position=data.get('column_position', 0),
+                button_width=data.get('button_width', 1),
+                metadata=data.get('metadata')
+            )
+            
+            if success:
+                return jsonify({'success': True, 'message': 'Button configuration created'})
+            else:
+                return jsonify({'success': False, 'error': 'Failed to create button configuration'}), 500
+        except Exception as e:
+            logger.error(f"Error creating button config: {e}")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    @flask_app.route('/api/button-configs/<int:button_id>', methods=['PUT'])
+    @login_required
+    @csrf.exempt
+    def update_button_config_api(button_id):
+        """Update an existing button configuration"""
+        try:
+            data = request.json
+            logger.info(f"API update request for button {button_id}: {data}")
+            
+            success = update_button_config(
+                button_id=button_id,
+                text=data.get('text'),
+                callback_data=data.get('callback_data'),
+                url=data.get('url'),
+                row_position=data.get('row_position'),
+                column_position=data.get('column_position'),
+                button_width=data.get('button_width'),
+                is_active=data.get('is_active'),
+                sort_order=data.get('sort_order'),
+                metadata=data.get('metadata')
+            )
+            
+            if success:
+                logger.info(f"Successfully updated button {button_id}")
+                return jsonify({'success': True, 'message': 'Button configuration updated'})
+            else:
+                logger.error(f"Failed to update button {button_id}")
+                return jsonify({'success': False, 'error': 'Failed to update button configuration'}), 500
+        except Exception as e:
+            logger.error(f"Error updating button config {button_id}: {e}")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    @flask_app.route('/api/button-configs/<int:button_id>', methods=['DELETE'])
+    @login_required
+    @csrf.exempt
+    def delete_button_config_api(button_id):
+        """Delete a button configuration"""
+        try:
+            success = delete_button_config(button_id)
+            if success:
+                return jsonify({'success': True, 'message': 'Button configuration deleted'})
+            else:
+                return jsonify({'success': False, 'error': 'Failed to delete button configuration'}), 500
+        except Exception as e:
+            logger.error(f"Error deleting button config {button_id}: {e}")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    @flask_app.route('/api/button-configs/<menu_type>/reorder', methods=['POST'])
+    @login_required
+    @csrf.exempt
+    def reorder_button_configs_api(menu_type):
+        """Reorder button configurations for a menu type"""
+        try:
+            data = request.json
+            button_orders = data.get('button_orders', [])
+
+
+            
+            success = reorder_button_configs(menu_type, button_orders)
+            
+            if success:
+                logger.info(f"Successfully reordered buttons for {menu_type}")
+                return jsonify({'success': True, 'message': 'Button configurations reordered'})
+            else:
+                logger.error(f"Failed to reorder buttons for {menu_type}")
+                return jsonify({'success': False, 'error': 'Failed to reorder button configurations'}), 500
+        except Exception as e:
+            logger.error(f"Error reordering button configs for {menu_type}: {e}")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    @flask_app.route('/users/<int:user_id>/send-message', methods=['POST'])
+    @login_required
+    @csrf.exempt
+    def send_user_message_route(user_id):
+        """Send a message to a user via bot"""
+        try:
+            message_text = request.form.get('message', '').strip()
+            
+            if not message_text:
+                return jsonify({'ok': False, 'error': 'Сообщение не может быть пустым'}), 400
+            
+            
+            bot = _bot_controller.get_bot_instance()
+            if not bot:
+                return jsonify({'ok': False, 'error': 'Бот недоступен'}), 500
+            
+            
+            loop = current_app.config.get('EVENT_LOOP')
+            if not loop or not loop.is_running():
+                return jsonify({'ok': False, 'error': 'Event loop недоступен'}), 500
+            
+            
+            async def send_message():
+                try:
+                    await bot.send_message(chat_id=user_id, text=message_text)
+                    return True
+                except Exception as e:
+                    logger.error(f"Failed to send message to user {user_id}: {e}")
+                    return False
+            
+            
+            future = asyncio.run_coroutine_threadsafe(send_message(), loop)
+            success = future.result(timeout=10)
+            
+            if success:
+                logger.info(f"Message sent to user {user_id}")
+                return jsonify({'ok': True, 'message': 'Сообщение успешно отправлено'})
+            else:
+                return jsonify({'ok': False, 'error': 'Не удалось отправить сообщение'}), 500
+                
+        except Exception as e:
+            logger.error(f"Error sending message to user {user_id}: {e}")
+            return jsonify({'ok': False, 'error': str(e)}), 500
+
+    @flask_app.route('/button-constructor')
+    @login_required
+    def button_constructor_page():
+        """Button constructor page"""
+        template_data = get_common_template_data()
+        return render_template('button_constructor.html', **template_data)
+
     return flask_app
+
+

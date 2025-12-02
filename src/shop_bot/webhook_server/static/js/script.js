@@ -1,10 +1,10 @@
 document.addEventListener('DOMContentLoaded', function () {
-    // CSRF helper (meta -> token)
+
     function getCsrfToken(){
         const meta = document.querySelector('meta[name="csrf-token"]');
         return meta ? meta.getAttribute('content') : '';
     }
-    // Programmatic toast API
+
     window.showToast = function(category, message, delay){
         try{
             const cont = document.getElementById('toast-container');
@@ -18,7 +18,16 @@ document.addEventListener('DOMContentLoaded', function () {
             new bootstrap.Toast(el, { delay: Math.max(2000, delay||4000), autohide: true }).show();
         }catch(_){ }
     }
-    // Global partial refresh by container id
+
+    function isFullDocument(html){
+        if (!html) return false;
+        const s = String(html).trim().slice(0, 512).toLowerCase();
+        if (s.startsWith('<!doctype') || s.startsWith('<html')) return true;
+
+        if (s.includes('<head') && s.includes('<title') && s.includes('</html>')) return true;
+        return false;
+    }
+
     window.refreshContainerById = async function(id){
         const node = document.getElementById(id);
         if (!node) return;
@@ -30,8 +39,12 @@ document.addEventListener('DOMContentLoaded', function () {
             if (resp.status === 401 || resp.status === 403) { window.location.href = '/login'; return; }
             if (!resp.ok) return;
             const html = await resp.text();
+            if (isFullDocument(html)) {
+                try { window.showToast('warning', 'Не удалось обновить блок: получена HTML-страница сервера.'); } catch(_){ }
+                return;
+            }
             if (html && html !== node.innerHTML) {
-                // lock height to avoid layout shift
+
                 const prevH = node.offsetHeight;
                 if (prevH > 0) node.style.minHeight = prevH + 'px';
                 node.classList.add('is-swapping');
@@ -41,18 +54,18 @@ document.addEventListener('DOMContentLoaded', function () {
                     setTimeout(()=> node.classList.remove('flash'), 600);
                 } catch(_){ }
                 try { initTooltipsWithin(node); } catch(_){ }
-                // Re-bind confirmation/AJAX handlers for newly injected forms
+
                 try { setupConfirmationForms(node); } catch(_){ }
-                // unlock after transition
+
                 setTimeout(()=>{ node.style.minHeight = ''; node.classList.remove('is-swapping'); }, 260);
             }
         } catch(_){ }
     }
-    // Init tooltips helpers
+
     function initTooltipsWithin(root){
         if (!window.bootstrap) return;
         const scope = root || document;
-        // уничтожаем старые тултипы, если есть data-bs-toggle
+
         scope.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(el=>{
             try { bootstrap.Tooltip.getInstance(el)?.dispose(); } catch(_){ }
         });
@@ -61,7 +74,7 @@ document.addEventListener('DOMContentLoaded', function () {
             try { new bootstrap.Tooltip(el, { container: 'body' }); } catch(_){ }
         });
     }
-    // Attach CSRF token to all POST forms
+
     function initializeCsrfForForms() {
         const meta = document.querySelector('meta[name="csrf-token"]');
         const token = meta ? meta.getAttribute('content') : null;
@@ -80,10 +93,10 @@ document.addEventListener('DOMContentLoaded', function () {
             });
         });
     }
-    // Theme toggle: persists selection and updates <html data-bs-theme>
+
     function initializeThemeToggle() {
         const THEME_KEY = 'ui_theme';
-        const root = document.documentElement; // <html>
+        const root = document.documentElement;
         const btn = document.getElementById('theme-toggle');
         const label = btn ? btn.querySelector('.theme-label') : null;
 
@@ -94,7 +107,7 @@ document.addEventListener('DOMContentLoaded', function () {
             if (label) label.textContent = next === 'dark' ? 'Тёмная' : 'Светлая';
         }
 
-        // Get saved or default theme
+
         let saved = 'dark';
         try { saved = localStorage.getItem(THEME_KEY) || 'dark'; } catch (_) {}
         applyTheme(saved);
@@ -111,13 +124,13 @@ document.addEventListener('DOMContentLoaded', function () {
     function initializePasswordToggles() {
         const togglePasswordButtons = document.querySelectorAll('.toggle-password');
         togglePasswordButtons.forEach(button => {
-            // Инициализируем иконку согласно текущему состоянию
+
             const parent = button.closest('.password-wrapper') || button.closest('.form-group') || document;
             const input = parent.querySelector('input[type="password"], input[type="text"]');
             const setIcon = () => {
                 if (!input) return;
                 const isHidden = input.type === 'password';
-                // если внутри уже есть SVG/иконка — не перетираем, только title/aria
+
                 if (!button.querySelector('svg')) {
                     button.textContent = isHidden ? '👁️' : '🙈';
                 }
@@ -175,12 +188,12 @@ document.addEventListener('DOMContentLoaded', function () {
                     event.preventDefault();
                     return;
                 }
-                // AJAX delete
+
                 if (form.getAttribute('data-ajax') === 'delete') {
                     event.preventDefault();
                     try {
                         const fd = new FormData(form);
-                        // ensure csrf present
+
                         if (!fd.get('csrf_token')){
                             const t = getCsrfToken();
                             if (t) fd.append('csrf_token', t);
@@ -203,7 +216,7 @@ document.addEventListener('DOMContentLoaded', function () {
         });
     }
 
-    // Center all modals by default (unless already centered)
+
     document.querySelectorAll('.modal .modal-dialog').forEach(dlg => {
         if (!dlg.classList.contains('modal-dialog-centered')) {
             dlg.classList.add('modal-dialog-centered');
@@ -253,7 +266,7 @@ document.addEventListener('DOMContentLoaded', function () {
             chart.options.scales.y.ticks.font.size = isMobile ? 10 : 12;
             chart.options.plugins.legend.labels.font.size = isMobile ? 12 : 14;
             chart.options.scales.x.ticks.maxTicksLimit = isMobile ? 8 : 15;
-            // 
+
             chart.options.scales.x.ticks.display = !isVerySmall;
             chart.options.scales.y.ticks.display = !isVerySmall;
             chart.options.plugins.legend.display = !isVerySmall;
@@ -372,7 +385,7 @@ document.addEventListener('DOMContentLoaded', function () {
             updateChartFontsAndLabels(keysChart);
         });
 
-        // --- Auto refresh charts data without page reload ---
+
         async function refreshCharts(){
             try{
                 const resp = await fetch('/dashboard/charts.json', { headers: { 'Accept': 'application/json' }, credentials: 'same-origin', cache: 'no-store' });
@@ -389,9 +402,13 @@ document.addEventListener('DOMContentLoaded', function () {
                 keysChart.data.datasets[0].data = newKeys.datasets[0].data;
                 usersChart.update('none');
                 keysChart.update('none');
-            }catch(_){/* noop */}
+            }catch(_){}
         }
-        setInterval(refreshCharts, 10000);
+        
+
+        setTimeout(() => {
+            setInterval(refreshCharts, 10000);
+        }, 1500);
     }
 
     function initializeTicketAutoRefresh() {
@@ -487,7 +504,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 lastKey = key;
                 lastCount = items.length;
             } catch (e) {
-                // silent
+
             }
         }
 
@@ -496,12 +513,12 @@ document.addEventListener('DOMContentLoaded', function () {
         window.addEventListener('beforeunload', () => clearInterval(interval));
     }
 
-    // Глобальная авто-перезагрузка отключена по требованию: оставляем только точечные авто-обновления без reload
+
     function initializeGlobalAutoRefresh() {
-        /* disabled */
+        
     }
 
-    // Черновая схема выборочного автообновления блоков по data-fetch-url (под будущие включения)
+
     function initializeSoftAutoUpdate() {
         const nodes = Array.from(document.querySelectorAll('[data-fetch-url]'));
         if (!nodes.length) return;
@@ -510,13 +527,24 @@ document.addEventListener('DOMContentLoaded', function () {
             const interval = Number(node.getAttribute('data-fetch-interval')||'8000');
             if (!url) return;
             let timer = null;
+            let isFirstLoad = true;
+            
             async function tick(){
                 try{
+
+                    if (!isFirstLoad) {
+                        node.classList.add('loading');
+                    }
+                    
                     const resp = await fetch(url, { headers: { 'Accept': 'text/html' }, cache: 'no-store', credentials: 'same-origin' });
                     if (resp.redirected) { window.location.href = resp.url; return; }
                     if (resp.status === 401 || resp.status === 403) { window.location.href = '/login'; return; }
                     if (!resp.ok) return;
                     const html = await resp.text();
+                    if (isFullDocument(html)) {
+                        try { window.showToast('warning', 'Автообновление пропущено: получена HTML-страница сервера.'); } catch(_){ }
+                        return;
+                    }
                     if (html && html !== node.innerHTML) {
                         const prevH = node.offsetHeight;
                         if (prevH > 0) node.style.minHeight = prevH + 'px';
@@ -526,34 +554,46 @@ document.addEventListener('DOMContentLoaded', function () {
                             node.classList.add('flash');
                             setTimeout(()=> node.classList.remove('flash'), 600);
                         } catch(_){ }
-                        // re-init tooltips and confirmation handlers for new content
+
                         try { initTooltipsWithin(node); } catch(_){ }
                         try { setupConfirmationForms(node); } catch(_){ }
                         setTimeout(()=>{ node.style.minHeight = ''; node.classList.remove('is-swapping'); }, 260);
                     }
-                }catch(_){/* noop */}
+                    
+
+                    node.classList.remove('loading');
+                    if (isFirstLoad) {
+                        node.classList.add('dashboard-loaded');
+                        isFirstLoad = false;
+                    }
+                }catch(_){}
             }
-            tick();
-            timer = setInterval(tick, Math.max(4000, interval));
+            
+
+            setTimeout(() => {
+                tick();
+                timer = setInterval(tick, Math.max(4000, interval));
+            }, 1000);
+            
             node.addEventListener('soft-update-stop', ()=>{ if (timer){ clearInterval(timer); timer=null; } });
             window.addEventListener('beforeunload', ()=>{ if (timer){ clearInterval(timer); timer=null; } });
         });
     }
 
-    // Settings tabs: show/hide sections by hash and set active nav link
+
     function initializeSettingsTabs() {
         const nav = document.querySelector('.nav.nav-pills');
         const container = document.querySelector('.settings-container');
-        if (!nav || !container) return; // not on settings page
+        if (!nav || !container) return;
 
         const links = Array.from(nav.querySelectorAll('a.nav-link'));
-        // Собираем все секции автоматически
+
         const sections = Array.from(document.querySelectorAll('.settings-section'));
         const rightCol = document.querySelector('.settings-column-right');
 
         function show(targetHash) {
             const hash = (targetHash && targetHash.startsWith('#')) ? targetHash : '#panel';
-            // зафиксируем высоту правой колонки на время анимации, чтобы не было "рывков"
+
             let currentVisible = document.querySelector('.settings-column-right .settings-section:not(.is-hidden)');
             const currentHeight = currentVisible ? currentVisible.offsetHeight : 0;
             const targetEl = document.querySelector(hash);
@@ -565,7 +605,7 @@ document.addEventListener('DOMContentLoaded', function () {
             sections.forEach(sec => {
                 const isTarget = ('#' + sec.id === hash);
                 if (isTarget) {
-                    // Показать секцию и восстановить required для элементов, где он был
+
                     sec.classList.remove('is-hidden');
                     try {
                         sec.querySelectorAll('input, select, textarea').forEach(el => {
@@ -575,9 +615,9 @@ document.addEventListener('DOMContentLoaded', function () {
                                 el.removeAttribute('data-was-required');
                             }
                         });
-                    } catch (_) { /* noop */ }
+                    } catch (_) {  }
                 } else {
-                    // Скрыть секцию и временно снять required, чтобы браузер не требовал заполнения
+
                     sec.classList.add('is-hidden');
                     try {
                         sec.querySelectorAll('input, select, textarea').forEach(el => {
@@ -586,14 +626,14 @@ document.addEventListener('DOMContentLoaded', function () {
                                 el.removeAttribute('required');
                             }
                         });
-                    } catch (_) { /* noop */ }
+                    } catch (_) {  }
                 }
             });
             links.forEach(a => {
                 if (a.getAttribute('href') === hash) a.classList.add('active');
                 else a.classList.remove('active');
             });
-            // Если не нашли секцию по hash — показать первую существующую
+
             const anyVisible = sections.some(sec => !sec.classList.contains('is-hidden'));
             if (!anyVisible && sections.length) {
                 sections[0].classList.remove('is-hidden');
@@ -605,12 +645,12 @@ document.addEventListener('DOMContentLoaded', function () {
                             el.removeAttribute('data-was-required');
                         }
                     });
-                } catch (_) { /* noop */ }
+                } catch (_) {  }
             }
-            // снять фиксацию высоты после завершения анимации скрытия/показа
+
             if (rightCol) setTimeout(() => { rightCol.style.minHeight = ''; }, 260);
 
-            // Единый макет для вкладки Хосты: скрываем правую колонку, растягиваем левую
+
             const leftCol = document.querySelector('.settings-column-left');
             if (hash === '#hosts') {
                 if (rightCol) rightCol.style.display = 'none';
@@ -627,7 +667,7 @@ document.addEventListener('DOMContentLoaded', function () {
             }
         }
 
-        // Click navigation без скачка страницы: используем replaceState и синхронизируем ?tab
+
         links.forEach(a => {
             a.addEventListener('click', (e) => {
                 e.preventDefault();
@@ -635,61 +675,61 @@ document.addEventListener('DOMContentLoaded', function () {
                 if (!href) return;
                 const y = window.scrollY;
                 show(href);
-                // Обновим адресную строку (и hash, и ?tab), не триггеря прокрутку
+
                 const tabName = href.startsWith('#') ? href.slice(1) : href;
                 try { history.replaceState(null, '', `?tab=${encodeURIComponent(tabName)}${href}`); } catch(_) {}
-                // восстановим исходную позицию
+
                 window.scrollTo(0, y);
             });
         });
 
-        // Обработка внешнего изменения hash (ручной ввод) без скачка
+
         window.addEventListener('hashchange', () => {
             const y = window.scrollY;
             show(location.hash);
             window.scrollTo(0, y);
         });
 
-        // Initial state (без скачка): поддержка ?tab=...
+
         const params = new URLSearchParams(window.location.search);
         const tabParam = params.get('tab');
         const initialHash = tabParam ? `#${tabParam}` : (location.hash || '#panel');
         show(initialHash);
-        // Синхронизируем URL, чтобы и hash, и ?tab были установлены
+
         try {
             const tabName = initialHash.startsWith('#') ? initialHash.slice(1) : initialHash;
             history.replaceState(null, '', `?tab=${encodeURIComponent(tabName)}${initialHash}`);
         } catch(_) {}
     }
 
-    // Initialize modules once DOM is ready
+
     initTooltipsWithin(document);
     initializePasswordToggles();
     setupBotControlForms();
     setupConfirmationForms();
     initializeDashboardCharts();
     initializeTicketAutoRefresh();
-    // Автоперезагрузка выключена: initializeGlobalAutoRefresh();
+
     initializeSoftAutoUpdate();
     initializeSettingsTabs();
     initializeThemeToggle();
     initializeCsrfForForms();
 
-    // --- Backup/Restore UI (settings -> panel) ---
+
     (function initializeBackupRestoreUI(){
         const select = document.getElementById('existing_backup');
         const dateBadge = document.getElementById('backup-date');
         const pickBtn = document.getElementById('btn-pick-file');
         const fileInput = document.getElementById('db_file');
         const fileNameBox = document.getElementById('picked-file-name');
-        if (!select && !fileInput) return; // not on settings panel
+        if (!select && !fileInput) return;
 
         function setDateText(val){
             if (!dateBadge) return;
             dateBadge.textContent = val && val.trim() ? val : '—';
         }
 
-        // When select changes — show date and clear file input
+
         if (select){
             select.addEventListener('change', () => {
                 const opt = select.options[select.selectedIndex];
@@ -702,7 +742,7 @@ document.addEventListener('DOMContentLoaded', function () {
             });
         }
 
-        // Pretty file picker: open hidden input, show filename, clear select
+
         if (pickBtn && fileInput){
             pickBtn.addEventListener('click', () => {
                 try { fileInput.click(); } catch(_){ }
@@ -715,7 +755,7 @@ document.addEventListener('DOMContentLoaded', function () {
             });
         }
 
-        // Soft-select UI for existing_backup — unify behavior with referral soft-select
+
         (function(){
             const wrap = document.querySelector('.soft-select[data-target="existing_backup"]');
             const selectEl = document.getElementById('existing_backup');
@@ -730,11 +770,11 @@ document.addEventListener('DOMContentLoaded', function () {
             }
 
             function build(){
-                // Render menu items (fixed-position container like in referral soft-select)
+
                 menuEl.innerHTML = '';
                 const opts = Array.from(selectEl.options||[]);
 
-                // First placeholder
+
                 const ph = document.createElement('div');
                 ph.className = 'soft-select-item is-placeholder' + (selectEl.value === '' ? ' is-active' : '');
                 ph.textContent = '— Выберите архив из списка —';
@@ -745,22 +785,22 @@ document.addEventListener('DOMContentLoaded', function () {
                 });
                 menuEl.appendChild(ph);
 
-                // Items
+
                 opts.forEach(opt => {
-                    if (opt.value === '') return; // skip placeholder option
+                    if (opt.value === '') return;
                     const item = document.createElement('div');
                     item.className = 'soft-select-item' + (opt.selected ? ' is-active' : '');
                     item.dataset.value = opt.value;
                     item.textContent = labelForOption(opt);
                     item.addEventListener('click', () => {
                         selectEl.value = opt.value;
-                        // active visual
+
                         menuEl.querySelectorAll('.soft-select-item').forEach(n => n.classList.remove('is-active'));
                         item.classList.add('is-active');
-                        // update toggle label
+
                         toggleEl.textContent = labelForOption(opt);
                         closeMenu();
-                        // fire change
+
                         selectEl.dispatchEvent(new Event('change', { bubbles:true }));
                     });
                     menuEl.appendChild(item);
@@ -774,23 +814,23 @@ document.addEventListener('DOMContentLoaded', function () {
                 const r = toggleEl.getBoundingClientRect();
                 menuEl.style.position = 'fixed';
                 menuEl.style.left = `${Math.round(r.left)}px`;
-                // measure height to position upwards
+
                 const prevDisplay = menuEl.style.display;
                 menuEl.style.display = 'block';
                 const h = Math.max(0, menuEl.offsetHeight || 0);
-                // default: open upwards
+
                 let top = Math.round(r.top - h - 6);
-                // clamp to viewport top; if not enough space, fallback below
+
                 if (top < 8) {
                     const below = Math.round(r.bottom + 6);
-                    // if opening below goes off-screen bottom, still clamp to 8
+
                     const maxBottom = window.innerHeight - 8;
                     top = Math.min(below, maxBottom - h);
                 }
                 menuEl.style.top = `${top}px`;
                 menuEl.style.width = `${Math.round(r.width)}px`;
                 menuEl.style.zIndex = '1065';
-                // restore intended visibility state
+
                 menuEl.style.display = prevDisplay || 'block';
             }
             function openMenu(){
@@ -816,7 +856,7 @@ document.addEventListener('DOMContentLoaded', function () {
             document.addEventListener('click', (e)=>{ if (!wrap.contains(e.target)) closeMenu(); });
             document.addEventListener('keydown', (e)=>{ if (e.key === 'Escape') closeMenu(); });
 
-            // Keep toggle label and date badge in sync
+
             selectEl.addEventListener('change', ()=>{
                 const selOpt = selectEl.options[selectEl.selectedIndex];
                 toggleEl.textContent = labelForOption(selOpt);
@@ -828,7 +868,7 @@ document.addEventListener('DOMContentLoaded', function () {
         })();
     })();
 
-    // Referrals UI (settings): show/hide fields by reward type and sync legacy toggle
+
     (function(){
         const select = document.getElementById('referral_reward_type');
         const compatToggle = document.getElementById('enable_fixed_referral_bonus');
@@ -847,7 +887,7 @@ document.addEventListener('DOMContentLoaded', function () {
         select.addEventListener('change', apply);
     })();
 
-    // Soft-select for referral_reward_type (pretty dropdown like in Admin Keys)
+
     (function(){
         const wrap = document.querySelector('.soft-select[data-target="referral_reward_type"]');
         const selectEl = document.getElementById('referral_reward_type');
@@ -857,7 +897,7 @@ document.addEventListener('DOMContentLoaded', function () {
         if (!toggleEl || !menuEl) return;
 
         function build(){
-            // Render menu items
+
             menuEl.innerHTML = '';
             const opts = Array.from(selectEl.options||[]);
             opts.forEach(opt => {
@@ -867,13 +907,13 @@ document.addEventListener('DOMContentLoaded', function () {
                 item.textContent = opt.textContent || '';
                 item.addEventListener('click', () => {
                     selectEl.value = opt.value;
-                    // active visual
+
                     menuEl.querySelectorAll('.soft-select-item').forEach(n => n.classList.remove('is-active'));
                     item.classList.add('is-active');
-                    // update toggle text
+
                     toggleEl.textContent = opt.textContent || '';
                     closeMenu();
-                    // fire change
+
                     selectEl.dispatchEvent(new Event('change', { bubbles:true }));
                 });
                 menuEl.appendChild(item);
@@ -913,12 +953,12 @@ document.addEventListener('DOMContentLoaded', function () {
         document.addEventListener('click', (e)=>{ if (!wrap.contains(e.target)) closeMenu(); });
         document.addEventListener('keydown', (e)=>{ if (e.key==='Escape') closeMenu(); });
 
-        // Rebuild on external changes
+
         selectEl.addEventListener('change', build);
         build();
     })();
 
-    // Inline edit rows (URL/Имя хоста)
+
     document.querySelectorAll('[data-edit-row]').forEach(row => {
         const input = row.querySelector('[data-edit-target]');
         const btnEdit = row.querySelector('[data-action="edit"]');

@@ -1,23 +1,105 @@
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 from pathlib import Path
 import json
 import re
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path("/app/project")
-DB_FILE = PROJECT_ROOT / "users.db"
+
+import os
+if os.path.exists("/app/project/users.db"):
+
+    DB_FILE = Path("/app/project/users.db")
+elif os.path.exists("users-20251005-173430.db"):
+
+    DB_FILE = Path("users-20251005-173430.db")
+elif os.path.exists("users.db"):
+
+    DB_FILE = Path("users.db")
+else:
+
+    DB_FILE = Path("users.db")
+
+
+def _now_str() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _to_datetime_str(ts_ms: int | None) -> str | None:
+    if ts_ms is None:
+        return None
+    try:
+        dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def _normalize_email(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip().lower()
+    return cleaned or None
+
+
+def _normalize_key_row(row: sqlite3.Row | dict | None) -> dict | None:
+    if row is None:
+        return None
+    data = dict(row)
+    email = _normalize_email(data.get("email") or data.get("key_email"))
+    if email:
+        data["email"] = email
+        data["key_email"] = email
+    rem_uuid = data.get("remnawave_user_uuid") or data.get("xui_client_uuid")
+    if rem_uuid:
+        data["remnawave_user_uuid"] = rem_uuid
+        data["xui_client_uuid"] = rem_uuid
+    expire_value = data.get("expire_at") or data.get("expiry_date")
+    if expire_value:
+        expire_str = expire_value.strftime("%Y-%m-%d %H:%M:%S") if isinstance(expire_value, datetime) else str(expire_value)
+        data["expire_at"] = expire_str
+        data["expiry_date"] = expire_str
+    created_value = data.get("created_at") or data.get("created_date")
+    if created_value:
+        created_str = created_value.strftime("%Y-%m-%d %H:%M:%S") if isinstance(created_value, datetime) else str(created_value)
+        data["created_at"] = created_str
+        data["created_date"] = created_str
+    subscription_url = data.get("subscription_url") or data.get("connection_string")
+    if subscription_url:
+        data["subscription_url"] = subscription_url
+        data.setdefault("connection_string", subscription_url)
+    return data
+
+
+def _get_table_columns(cursor: sqlite3.Cursor, table: str) -> set[str]:
+    cursor.execute(f"PRAGMA table_info({table})")
+    return {row[1] for row in cursor.fetchall()}
+
+
+def _ensure_table_column(cursor: sqlite3.Cursor, table: str, column: str, definition: str) -> None:
+    columns = _get_table_columns(cursor, table)
+    if column not in columns:
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _ensure_unique_index(cursor: sqlite3.Cursor, name: str, table: str, column: str) -> None:
+    cursor.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS {name} ON {table}({column})")
+
+
+def _ensure_index(cursor: sqlite3.Cursor, name: str, table: str, column: str) -> None:
+    cursor.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table}({column})")
+
 
 def normalize_host_name(name: str | None) -> str:
-    """Normalize host name by trimming and removing invisible/unicode spaces.
-    Removes: NBSP(\u00A0), ZERO WIDTH SPACE(\u200B), ZWNJ(\u200C), ZWJ(\u200D), BOM(\uFEFF).
-    """
+    """Normalize host name by trimming and removing invisible/unicode spaces."""
     s = (name or "").strip()
     for ch in ("\u00A0", "\u200B", "\u200C", "\u200D", "\uFEFF"):
         s = s.replace(ch, "")
     return s
+
 
 def initialize_db():
     try:
@@ -25,8 +107,11 @@ def initialize_db():
             cursor = conn.cursor()
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS users (
-                    telegram_id INTEGER PRIMARY KEY, username TEXT, total_spent REAL DEFAULT 0,
-                    total_months INTEGER DEFAULT 0, trial_used BOOLEAN DEFAULT 0,
+                    telegram_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    total_spent REAL DEFAULT 0,
+                    total_months INTEGER DEFAULT 0,
+                    trial_used BOOLEAN DEFAULT 0,
                     agreed_to_terms BOOLEAN DEFAULT 0,
                     registration_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     is_banned BOOLEAN DEFAULT 0,
@@ -37,15 +122,36 @@ def initialize_db():
                     referral_start_bonus_received BOOLEAN DEFAULT 0
                 )
             ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS pending_transactions (
+                    payment_id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    amount_rub REAL,
+                    metadata TEXT,
+                    status TEXT DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS vpn_keys (
                     key_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL,
-                    host_name TEXT NOT NULL,
-                    xui_client_uuid TEXT NOT NULL,
-                    key_email TEXT NOT NULL UNIQUE,
-                    expiry_date TIMESTAMP,
-                    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    host_name TEXT,
+                    squad_uuid TEXT,
+                    remnawave_user_uuid TEXT,
+                    short_uuid TEXT,
+                    email TEXT UNIQUE,
+                    key_email TEXT UNIQUE,
+                    subscription_url TEXT,
+                    expire_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    traffic_limit_bytes INTEGER,
+                    traffic_limit_strategy TEXT DEFAULT 'NO_RESET',
+                    tag TEXT,
+                    description TEXT
                 )
             ''')
             cursor.execute('''
@@ -70,36 +176,71 @@ def initialize_db():
                 )
             ''')
             cursor.execute('''
+                CREATE TABLE IF NOT EXISTS button_configs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    menu_type TEXT NOT NULL,
+                    button_id TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    callback_data TEXT,
+                    url TEXT,
+                    row_position INTEGER DEFAULT 0,
+                    column_position INTEGER DEFAULT 0,
+                    button_width INTEGER DEFAULT 1,
+                    is_active INTEGER DEFAULT 1,
+                    sort_order INTEGER DEFAULT 0,
+                    metadata TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(menu_type, button_id)
+                )
+            ''')
+            cursor.execute('''
                 CREATE TABLE IF NOT EXISTS xui_hosts(
-                    host_name TEXT NOT NULL,
-                    host_url TEXT NOT NULL,
-                    host_username TEXT NOT NULL,
-                    host_pass TEXT NOT NULL,
-                    host_inbound_id INTEGER NOT NULL,
+                    host_name TEXT PRIMARY KEY,
+                    squad_uuid TEXT UNIQUE,
+                    description TEXT,
+                    default_traffic_limit_bytes INTEGER,
+                    default_traffic_strategy TEXT DEFAULT 'NO_RESET',
+                    host_url TEXT,
+                    host_username TEXT,
+                    host_pass TEXT,
+                    host_inbound_id INTEGER,
                     subscription_url TEXT,
                     ssh_host TEXT,
                     ssh_port INTEGER,
                     ssh_user TEXT,
                     ssh_password TEXT,
-                    ssh_key_path TEXT
+                    ssh_key_path TEXT,
+                    is_active INTEGER DEFAULT 1,
+                    sort_order INTEGER DEFAULT 0,
+                    metadata TEXT
                 )
             ''')
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS plans (
                     plan_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    host_name TEXT NOT NULL,
+                    host_name TEXT,
+                    squad_uuid TEXT,
                     plan_name TEXT NOT NULL,
-                    months INTEGER NOT NULL,
+                    months INTEGER,
+                    duration_days INTEGER,
                     price REAL NOT NULL,
+                    traffic_limit_bytes INTEGER,
+                    traffic_limit_strategy TEXT DEFAULT 'NO_RESET',
+                    is_active INTEGER DEFAULT 1,
+                    sort_order INTEGER DEFAULT 0,
+                    metadata TEXT,
                     FOREIGN KEY (host_name) REFERENCES xui_hosts (host_name)
                 )
-            ''')            
+            ''')
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS support_tickets (
                     ticket_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'open',
+                    status TEXT NOT NULL DEFAULT "open",
                     subject TEXT,
+                    forum_chat_id TEXT,
+                    message_thread_id INTEGER,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -108,18 +249,23 @@ def initialize_db():
                 CREATE TABLE IF NOT EXISTS support_messages (
                     message_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     ticket_id INTEGER NOT NULL,
-                    sender TEXT NOT NULL, -- 'user' | 'admin'
+                    sender TEXT NOT NULL,
                     content TEXT NOT NULL,
-                    media TEXT, -- JSON with Telegram file_id(s), type, caption, mime, size, etc.
+                    media TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (ticket_id) REFERENCES support_tickets (ticket_id)
                 )
             ''')
+
+            try:
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_support_tickets_thread ON support_tickets(forum_chat_id, message_thread_id)")
+            except Exception:
+                pass
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS host_speedtests (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     host_name TEXT NOT NULL,
-                    method TEXT NOT NULL, -- 'ssh' | 'net'
+                    method TEXT NOT NULL,
                     ping_ms REAL,
                     jitter_ms REAL,
                     download_mbps REAL,
@@ -132,6 +278,38 @@ def initialize_db():
                 )
             ''')
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_host_speedtests_host_time ON host_speedtests(host_name, created_at DESC)")
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS resource_metrics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scope TEXT NOT NULL,                -- 'local' | 'host' | 'target'
+                    object_name TEXT NOT NULL,          -- 'panel' | host_name | target_name
+                    cpu_percent REAL,
+                    mem_percent REAL,
+                    disk_percent REAL,
+                    load1 REAL,
+                    net_bytes_sent INTEGER,
+                    net_bytes_recv INTEGER,
+                    raw_json TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_resource_metrics_scope_time ON resource_metrics(scope, object_name, created_at DESC)")
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS speedtest_ssh_targets (
+                    target_name TEXT PRIMARY KEY,
+                    ssh_host TEXT NOT NULL,
+                    ssh_port INTEGER DEFAULT 22,
+                    ssh_user TEXT,
+                    ssh_password TEXT,
+                    ssh_key_path TEXT,
+                    description TEXT,
+                    is_active INTEGER DEFAULT 1,
+                    sort_order INTEGER DEFAULT 0,
+                    metadata TEXT
+                )
+            ''')
             default_settings = {
                 "panel_login": "admin",
                 "panel_password": "admin",
@@ -163,231 +341,420 @@ def initialize_db():
                 "ton_wallet_address": None,
                 "tonapi_key": None,
                 "support_forum_chat_id": None,
-                # Referral program advanced
                 "enable_fixed_referral_bonus": "false",
                 "fixed_referral_bonus_amount": "50",
-                "referral_reward_type": "percent_purchase",  # percent_purchase | fixed_purchase | fixed_start_referrer
+                "referral_reward_type": "percent_purchase",
                 "referral_on_start_referrer_amount": "20",
-                # Backups
                 "backup_interval_days": "1",
+
+                "monitoring_enabled": "true",
+                "monitoring_interval_sec": "300",
+                "monitoring_cpu_threshold": "90",
+                "monitoring_mem_threshold": "90",
+                "monitoring_disk_threshold": "90",
+                "monitoring_alert_cooldown_sec": "3600",
+                "remnawave_base_url": None,
+                "remnawave_api_token": None,
+                "remnawave_cookies": "{}",
+                "remnawave_is_local_network": "false",
+                "default_extension_days": "30",
+
+                "main_menu_text": None,
+                "howto_intro_text": None,
+                "howto_android_text": None,
+                "howto_ios_text": None,
+                "howto_windows_text": None,
+                "howto_linux_text": None,
+
+                "btn_trial_text": None,
+                "btn_profile_text": None,
+                "btn_my_keys_text": None,
+                "btn_buy_key_text": None,
+                "btn_topup_text": None,
+                "btn_referral_text": None,
+                "btn_support_text": None,
+                "btn_about_text": None,
+                "btn_speed_text": None,
+                "btn_howto_text": None,
+                "btn_admin_text": None,
+                "btn_back_to_menu_text": None,
+
+                "stars_enabled": "false",
+                "yoomoney_enabled": "false",
+                "yoomoney_wallet": None,
+                "yoomoney_secret": None,
+
+                "yoomoney_api_token": None,
+                "yoomoney_client_id": None,
+                "yoomoney_client_secret": None,
+                "yoomoney_redirect_uri": None,
+                "stars_per_rub": "1",
+                
+                "platega_enabled": "false",
+                "platega_merchant_id": None,
+                "platega_api_key": None,
             }
             run_migration()
             for key, value in default_settings.items():
-                cursor.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES (?, ?)", (key, value))
+                cursor.execute(
+                    "INSERT OR IGNORE INTO bot_settings (key, value) VALUES (?, ?)",
+                    (key, value),
+                )
             conn.commit()
-            logging.info("База данных успешно инициализирована.")
+            
+
+            initialize_default_button_configs()
+            
+
+            update_existing_my_keys_button()
+            
+
+            try:
+                cursor.execute("ALTER TABLE button_configs ADD COLUMN button_width INTEGER DEFAULT 1")
+                logging.info("Added button_width column to button_configs table")
+            except sqlite3.OperationalError:
+
+                pass
+            
+            logging.info("База данных инициализирована")
     except sqlite3.Error as e:
-        logging.error(f"Ошибка базы данных при инициализации: {e}")
+        logging.error("Не удалось инициализировать базу данных: %s", e)
+
+
+def _ensure_users_columns(cursor: sqlite3.Cursor) -> None:
+    mapping = {
+        "referred_by": "INTEGER",
+        "balance": "REAL DEFAULT 0",
+        "referral_balance": "REAL DEFAULT 0",
+        "referral_balance_all": "REAL DEFAULT 0",
+        "referral_start_bonus_received": "BOOLEAN DEFAULT 0",
+    }
+    for column, definition in mapping.items():
+        _ensure_table_column(cursor, "users", column, definition)
+
+
+def _ensure_hosts_columns(cursor: sqlite3.Cursor) -> None:
+    extras = {
+        "squad_uuid": "TEXT",
+        "description": "TEXT",
+        "default_traffic_limit_bytes": "INTEGER",
+        "default_traffic_strategy": "TEXT DEFAULT 'NO_RESET'",
+        "is_active": "INTEGER DEFAULT 1",
+        "sort_order": "INTEGER DEFAULT 0",
+        "metadata": "TEXT",
+        "subscription_url": "TEXT",
+        "ssh_host": "TEXT",
+        "ssh_port": "INTEGER",
+        "ssh_user": "TEXT",
+        "ssh_password": "TEXT",
+        "ssh_key_path": "TEXT",
+
+        "remnawave_base_url": "TEXT",
+        "remnawave_api_token": "TEXT",
+    }
+    for column, definition in extras.items():
+        _ensure_table_column(cursor, "xui_hosts", column, definition)
+
+
+def _ensure_plans_columns(cursor: sqlite3.Cursor) -> None:
+    extras = {
+        "squad_uuid": "TEXT",
+        "duration_days": "INTEGER",
+        "traffic_limit_bytes": "INTEGER",
+        "traffic_limit_strategy": "TEXT DEFAULT 'NO_RESET'",
+        "is_active": "INTEGER DEFAULT 1",
+        "sort_order": "INTEGER DEFAULT 0",
+        "metadata": "TEXT",
+    }
+    for column, definition in extras.items():
+        _ensure_table_column(cursor, "plans", column, definition)
+
+
+def _ensure_support_tickets_columns(cursor: sqlite3.Cursor) -> None:
+    extras = {
+        "forum_chat_id": "TEXT",
+        "message_thread_id": "INTEGER",
+    }
+    for column, definition in extras.items():
+        _ensure_table_column(cursor, "support_tickets", column, definition)
+
+
+def _finalize_vpn_key_indexes(cursor: sqlite3.Cursor) -> None:
+    _ensure_unique_index(cursor, "uq_vpn_keys_email", "vpn_keys", "email")
+    _ensure_unique_index(cursor, "uq_vpn_keys_key_email", "vpn_keys", "key_email")
+    _ensure_index(cursor, "idx_vpn_keys_user_id", "vpn_keys", "user_id")
+    _ensure_index(cursor, "idx_vpn_keys_rem_uuid", "vpn_keys", "remnawave_user_uuid")
+    _ensure_index(cursor, "idx_vpn_keys_expire_at", "vpn_keys", "expire_at")
+
+
+def _rebuild_vpn_keys_table(cursor: sqlite3.Cursor) -> None:
+    columns = _get_table_columns(cursor, "vpn_keys")
+    legacy_markers = {"xui_client_uuid", "expiry_date", "created_date", "connection_string"}
+    required = {"remnawave_user_uuid", "email", "expire_at", "created_at", "updated_at"}
+    if required.issubset(columns) and not (columns & legacy_markers):
+        _finalize_vpn_key_indexes(cursor)
+        return
+
+    cursor.execute("ALTER TABLE vpn_keys RENAME TO vpn_keys_legacy")
+    cursor.execute('''
+        CREATE TABLE vpn_keys (
+            key_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            host_name TEXT,
+            squad_uuid TEXT,
+            remnawave_user_uuid TEXT,
+            short_uuid TEXT,
+            email TEXT UNIQUE,
+            key_email TEXT UNIQUE,
+            subscription_url TEXT,
+            expire_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            traffic_limit_bytes INTEGER,
+            traffic_limit_strategy TEXT DEFAULT 'NO_RESET',
+            tag TEXT,
+            description TEXT
+        )
+    ''')
+    old_columns = _get_table_columns(cursor, "vpn_keys_legacy")
+
+    def has(column: str) -> bool:
+        return column in old_columns
+
+    def col(column: str, default: str = "NULL") -> str:
+        return column if has(column) else default
+
+    rem_uuid_expr = "remnawave_user_uuid" if has("remnawave_user_uuid") else ("xui_client_uuid" if has("xui_client_uuid") else "NULL")
+    email_expr = "LOWER(email)" if has("email") else ("LOWER(key_email)" if has("key_email") else "NULL")
+    key_email_expr = "LOWER(key_email)" if has("key_email") else ("LOWER(email)" if has("email") else "NULL")
+    subscription_expr = col("subscription_url", "connection_string" if has("connection_string") else "NULL")
+    expire_expr = col("expire_at", "expiry_date" if has("expiry_date") else "NULL")
+    created_expr = col("created_at", "created_date" if has("created_date") else "CURRENT_TIMESTAMP")
+    updated_expr = col("updated_at", created_expr)
+    traffic_strategy_expr = col("traffic_limit_strategy", "'NO_RESET'")
+
+    select_clause = ",\n            ".join([
+        f"{col('key_id')} AS key_id",
+        f"{col('user_id')} AS user_id",
+        f"{col('host_name')} AS host_name",
+        f"{col('squad_uuid')} AS squad_uuid",
+        f"{rem_uuid_expr} AS remnawave_user_uuid",
+        f"{col('short_uuid')} AS short_uuid",
+        f"{email_expr} AS email",
+        f"{key_email_expr} AS key_email",
+        f"{subscription_expr} AS subscription_url",
+        f"{expire_expr} AS expire_at",
+        f"{created_expr} AS created_at",
+        f"{updated_expr} AS updated_at",
+        f"{col('traffic_limit_bytes')} AS traffic_limit_bytes",
+        f"{traffic_strategy_expr} AS traffic_limit_strategy",
+        f"{col('tag')} AS tag",
+        f"{col('description')} AS description",
+    ])
+
+    cursor.execute(
+        f"""
+        INSERT INTO vpn_keys (
+            key_id,
+            user_id,
+            host_name,
+            squad_uuid,
+            remnawave_user_uuid,
+            short_uuid,
+            email,
+            key_email,
+            subscription_url,
+            expire_at,
+            created_at,
+            updated_at,
+            traffic_limit_bytes,
+            traffic_limit_strategy,
+            tag,
+            description
+        )
+        SELECT
+            {select_clause}
+        FROM vpn_keys_legacy
+        """
+    )
+    cursor.execute("DROP TABLE vpn_keys_legacy")
+    cursor.execute("SELECT MAX(key_id) FROM vpn_keys")
+    max_id = cursor.fetchone()[0]
+    if max_id is not None:
+        cursor.execute("INSERT OR REPLACE INTO sqlite_sequence(name, seq) VALUES('vpn_keys', ?)", (max_id,))
+    _finalize_vpn_key_indexes(cursor)
+
+
+def _ensure_vpn_keys_schema(cursor: sqlite3.Cursor) -> None:
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='vpn_keys'")
+    if cursor.fetchone() is None:
+        cursor.execute('''
+            CREATE TABLE vpn_keys (
+                key_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                host_name TEXT,
+                squad_uuid TEXT,
+                remnawave_user_uuid TEXT,
+                short_uuid TEXT,
+                email TEXT UNIQUE,
+                key_email TEXT UNIQUE,
+                subscription_url TEXT,
+                expire_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                traffic_limit_bytes INTEGER,
+                traffic_limit_strategy TEXT DEFAULT 'NO_RESET',
+                tag TEXT,
+                description TEXT
+            )
+        ''')
+        _finalize_vpn_key_indexes(cursor)
+        return
+    _rebuild_vpn_keys_table(cursor)
+
 
 def run_migration():
     if not DB_FILE.exists():
-        logging.error("Файл базы данных users.db не найден. Мигрировать нечего.")
+        logging.error("Файл базы данных отсутствует, миграция пропущена.")
         return
 
-    logging.info(f"Начинаю миграцию базы данных: {DB_FILE}")
+    logging.info("Запуск миграций базы данных: %s", DB_FILE)
 
     try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA foreign_keys = OFF")
+            _ensure_users_columns(cursor)
+            _ensure_hosts_columns(cursor)
+            _ensure_plans_columns(cursor)
+            _ensure_support_tickets_columns(cursor)
+            _ensure_vpn_keys_schema(cursor)
+            _ensure_ssh_targets_table(cursor)
+            _ensure_gift_tokens_table(cursor)
+            _ensure_promo_tables(cursor)
 
-        logging.info("Миграция таблицы 'users' ...")
-    
-        cursor.execute("PRAGMA table_info(users)")
-        columns = [row[1] for row in cursor.fetchall()]
-        
-        if 'referred_by' not in columns:
-            cursor.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
-            logging.info(" -> Столбец 'referred_by' успешно добавлен.")
-        else:
-            logging.info(" -> Столбец 'referred_by' уже существует.")
-            
-        if 'balance' not in columns:
-            cursor.execute("ALTER TABLE users ADD COLUMN balance REAL DEFAULT 0")
-            logging.info(" -> Столбец 'balance' успешно добавлен.")
-        else:
-            logging.info(" -> Столбец 'balance' уже существует.")
-        
-        if 'referral_balance' not in columns:
-            cursor.execute("ALTER TABLE users ADD COLUMN referral_balance REAL DEFAULT 0")
-            logging.info(" -> Столбец 'referral_balance' успешно добавлен.")
-        else:
-            logging.info(" -> Столбец 'referral_balance' уже существует.")
-        
-        if 'referral_balance_all' not in columns:
-            cursor.execute("ALTER TABLE users ADD COLUMN referral_balance_all REAL DEFAULT 0")
-            logging.info(" -> Столбец 'referral_balance_all' успешно добавлен.")
-        else:
-            logging.info(" -> Столбец 'referral_balance_all' уже существует.")
-
-        if 'referral_start_bonus_received' not in columns:
-            cursor.execute("ALTER TABLE users ADD COLUMN referral_start_bonus_received BOOLEAN DEFAULT 0")
-            logging.info(" -> Столбец 'referral_start_bonus_received' успешно добавлен.")
-        else:
-            logging.info(" -> Столбец 'referral_start_bonus_received' уже существует.")
-        
-        logging.info("Таблица 'users' успешно обновлена.")
-
-        logging.info("Миграция таблицы 'transactions' ...")
-
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='transactions'")
-        table_exists = cursor.fetchone()
-
-        if table_exists:
-            cursor.execute("PRAGMA table_info(transactions)")
-            trans_columns = [row[1] for row in cursor.fetchall()]
-            
-            if 'payment_id' in trans_columns and 'status' in trans_columns and 'username' in trans_columns:
-                logging.info("Таблица 'transactions' уже имеет новую структуру. Миграция не требуется.")
-            else:
-                backup_name = f"transactions_backup_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-                logging.warning(f"Обнаружена старая структура таблицы 'transactions'. Переименовываю в '{backup_name}' ...")
-                cursor.execute(f"ALTER TABLE transactions RENAME TO {backup_name}")
-                
-                logging.info("Создаю новую таблицу 'transactions' с корректной структурой ...")
-                create_new_transactions_table(cursor)
-                logging.info("Новая таблица 'transactions' успешно создана. Старые данные сохранены.")
-        else:
-            logging.info("Таблица 'transactions' не найдена. Создаю новую ...")
-            create_new_transactions_table(cursor)
-            logging.info("Новая таблица 'transactions' успешно создана.")
-
-        logging.info("Миграция таблицы 'support_tickets' ...")
-        cursor = conn.cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='support_tickets'")
-        table_exists = cursor.fetchone()
-        if table_exists:
-            cursor.execute("PRAGMA table_info(support_tickets)")
-            st_columns = [row[1] for row in cursor.fetchall()]
-            if 'forum_chat_id' not in st_columns:
-                cursor.execute("ALTER TABLE support_tickets ADD COLUMN forum_chat_id TEXT")
-                logging.info(" -> Столбец 'forum_chat_id' успешно добавлен в 'support_tickets'.")
-            else:
-                logging.info(" -> Столбец 'forum_chat_id' уже существует в 'support_tickets'.")
-            if 'message_thread_id' not in st_columns:
-                cursor.execute("ALTER TABLE support_tickets ADD COLUMN message_thread_id INTEGER")
-                logging.info(" -> Столбец 'message_thread_id' успешно добавлен в 'support_tickets'.")
-            else:
-                logging.info(" -> Столбец 'message_thread_id' уже существует в 'support_tickets'.")
-        else:
-            logging.warning("Таблица 'support_tickets' не найдена, пропускаю её миграцию.")
-
-        conn.commit()
-        
-        logging.info("Миграция таблицы 'support_messages' ...")
-        cursor = conn.cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='support_messages'")
-        table_exists = cursor.fetchone()
-        if table_exists:
-            cursor.execute("PRAGMA table_info(support_messages)")
-            sm_columns = [row[1] for row in cursor.fetchall()]
-            if 'media' not in sm_columns:
-                cursor.execute("ALTER TABLE support_messages ADD COLUMN media TEXT")
-                logging.info(" -> Столбец 'media' успешно добавлен в 'support_messages'.")
-            else:
-                logging.info(" -> Столбец 'media' уже существует в 'support_messages'.")
-        else:
-            logging.warning("Таблица 'support_messages' не найдена, пропускаю её миграцию.")
-        
-        logging.info("Миграция таблицы 'xui_hosts' ...")
-        cursor = conn.cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='xui_hosts'")
-        table_exists = cursor.fetchone()
-        if table_exists:
-            cursor.execute("PRAGMA table_info(xui_hosts)")
-            xh_columns = [row[1] for row in cursor.fetchall()]
-            if 'subscription_url' not in xh_columns:
-                cursor.execute("ALTER TABLE xui_hosts ADD COLUMN subscription_url TEXT")
-                logging.info(" -> Столбец 'subscription_url' успешно добавлен в 'xui_hosts'.")
-            else:
-                logging.info(" -> Столбец 'subscription_url' уже существует в 'xui_hosts'.")
-            # SSH settings for speedtests (optional)
-            if 'ssh_host' not in xh_columns:
-                cursor.execute("ALTER TABLE xui_hosts ADD COLUMN ssh_host TEXT")
-                logging.info(" -> Столбец 'ssh_host' успешно добавлен в 'xui_hosts'.")
-            if 'ssh_port' not in xh_columns:
-                cursor.execute("ALTER TABLE xui_hosts ADD COLUMN ssh_port INTEGER")
-                logging.info(" -> Столбец 'ssh_port' успешно добавлен в 'xui_hosts'.")
-            if 'ssh_user' not in xh_columns:
-                cursor.execute("ALTER TABLE xui_hosts ADD COLUMN ssh_user TEXT")
-                logging.info(" -> Столбец 'ssh_user' успешно добавлен в 'xui_hosts'.")
-            if 'ssh_password' not in xh_columns:
-                cursor.execute("ALTER TABLE xui_hosts ADD COLUMN ssh_password TEXT")
-                logging.info(" -> Столбец 'ssh_password' успешно добавлен в 'xui_hosts'.")
-            if 'ssh_key_path' not in xh_columns:
-                cursor.execute("ALTER TABLE xui_hosts ADD COLUMN ssh_key_path TEXT")
-                logging.info(" -> Столбец 'ssh_key_path' успешно добавлен в 'xui_hosts'.")
-            # Clean up host_name values from invisible spaces and trim
             try:
-                cursor.execute(
-                    """
-                    UPDATE xui_hosts
-                    SET host_name = TRIM(
-                        REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(host_name,
-                            char(160), ''),      -- NBSP
-                            char(8203), ''),     -- ZERO WIDTH SPACE
-                            char(8204), ''),     -- ZWNJ
-                            char(8205), ''),     -- ZWJ
-                            char(65279), ''      -- BOM
-                        )
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_support_tickets_thread ON support_tickets(forum_chat_id, message_thread_id)")
+            except Exception:
+                pass
+
+            try:
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS pending_transactions (
+                        payment_id TEXT PRIMARY KEY,
+                        user_id INTEGER NOT NULL,
+                        amount_rub REAL,
+                        metadata TEXT,
+                        status TEXT DEFAULT 'pending',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
-                    """
-                )
-                conn.commit()
-                logging.info(" -> Нормализованы существующие значения host_name в 'xui_hosts'.")
-            except Exception as e:
-                logging.warning(f" -> Не удалось нормализовать существующие значения host_name: {e}")
-        else:
-            logging.warning("Таблица 'xui_hosts' не найдена, пропускаю её миграцию.")
-        # Create table for host speedtests
-        try:
+                ''')
+            except Exception:
+                pass
+            cursor.execute("PRAGMA foreign_keys = ON")
+            conn.commit()
+    except sqlite3.Error as e:
+        logging.error("Сбой миграции базы данных: %s", e)
+
+
+def insert_resource_metric(
+    scope: str,
+    object_name: str,
+    *,
+    cpu_percent: float | None = None,
+    mem_percent: float | None = None,
+    disk_percent: float | None = None,
+    load1: float | None = None,
+    net_bytes_sent: int | None = None,
+    net_bytes_recv: int | None = None,
+    raw_json: str | None = None,
+) -> int | None:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
             cursor.execute(
                 '''
-                CREATE TABLE IF NOT EXISTS host_speedtests (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    host_name TEXT NOT NULL,
-                    method TEXT NOT NULL, -- 'ssh' | 'net'
-                    ping_ms REAL,
-                    jitter_ms REAL,
-                    download_mbps REAL,
-                    upload_mbps REAL,
-                    server_name TEXT,
-                    server_id TEXT,
-                    ok INTEGER NOT NULL DEFAULT 1,
-                    error TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                INSERT INTO resource_metrics (
+                    scope, object_name, cpu_percent, mem_percent, disk_percent, load1,
+                    net_bytes_sent, net_bytes_recv, raw_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''',
+                (
+                    (scope or '').strip(),
+                    (object_name or '').strip(),
+                    cpu_percent, mem_percent, disk_percent, load1,
+                    net_bytes_sent, net_bytes_recv, raw_json,
                 )
-                '''
             )
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_host_speedtests_host_time ON host_speedtests(host_name, created_at DESC)")
             conn.commit()
-            logging.info("Таблица 'host_speedtests' готова к использованию.")
-        except sqlite3.Error as e:
-            logging.error(f"Не удалось создать 'host_speedtests': {e}")
-
-        conn.close()
-        
-        logging.info("--- Миграция базы данных успешно завершена! ---")
-
+            return cursor.lastrowid
     except sqlite3.Error as e:
-        logging.error(f"Ошибка во время миграции: {e}")
+        logging.error("Failed to insert resource metric for %s/%s: %s", scope, object_name, e)
+        return None
 
-def create_new_transactions_table(cursor: sqlite3.Cursor):
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS transactions (
-            username TEXT,
-            transaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            payment_id TEXT UNIQUE NOT NULL,
-            user_id INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            amount_rub REAL NOT NULL,
-            amount_currency REAL,
-            currency_name TEXT,
-            payment_method TEXT,
-            metadata TEXT,
-            created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
+
+def get_latest_resource_metric(scope: str, object_name: str) -> dict | None:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                '''
+                SELECT * FROM resource_metrics
+                WHERE scope = ? AND object_name = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                ''',
+                ((scope or '').strip(), (object_name or '').strip())
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+    except sqlite3.Error as e:
+        logging.error("Failed to get latest resource metric for %s/%s: %s", scope, object_name, e)
+        return None
+
+
+def get_metrics_series(scope: str, object_name: str, *, since_hours: int = 24, limit: int = 500) -> list[dict]:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+
+
+            if since_hours == 1:
+                hours_filter = 2
+            else:
+                hours_filter = max(1, int(since_hours))
+            
+
+            cursor.execute(
+                f'''
+                SELECT created_at, cpu_percent, mem_percent, disk_percent, load1
+                FROM resource_metrics
+                WHERE scope = ? AND object_name = ?
+                  AND created_at >= datetime('now', ?)
+                ORDER BY created_at ASC
+                LIMIT ?
+                ''',
+                (
+                    (scope or '').strip(),
+                    (object_name or '').strip(),
+                    f'-{hours_filter} hours',
+                    max(10, int(limit)),
+                )
+            )
+            rows = cursor.fetchall() or []
+            
+
+            logging.debug(f"get_metrics_series: {scope}/{object_name}, since_hours={since_hours}, found {len(rows)} records")
+            
+            return [dict(r) for r in rows]
+    except sqlite3.Error as e:
+        logging.error("Failed to get metrics series for %s/%s: %s", scope, object_name, e)
+        return []
+
 
 def create_host(name: str, url: str, user: str, passwd: str, inbound: int, subscription_url: str | None = None):
     try:
@@ -474,6 +841,50 @@ def update_host_url(host_name: str, new_url: str) -> bool:
             return cursor.rowcount > 0
     except sqlite3.Error as e:
         logging.error(f"Не удалось обновить host_url для хоста '{host_name}': {e}")
+        return False
+
+def update_host_remnawave_settings(
+    host_name: str,
+    *,
+    remnawave_base_url: str | None = None,
+    remnawave_api_token: str | None = None,
+    squad_uuid: str | None = None,
+) -> bool:
+    """Обновить Remnawave-настройки на уровне конкретного хоста.
+    Пустые строки превращаются в NULL. Поля, равные None, не изменяются.
+    """
+    try:
+        host_name_n = normalize_host_name(host_name)
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM xui_hosts WHERE TRIM(host_name) = TRIM(?)", (host_name_n,))
+            if cursor.fetchone() is None:
+                logging.warning(f"update_host_remnawave_settings: хост не найден '{host_name_n}'")
+                return False
+
+            sets: list[str] = []
+            params: list[Any] = []
+            if remnawave_base_url is not None:
+                value = (remnawave_base_url or '').strip() or None
+                sets.append("remnawave_base_url = ?")
+                params.append(value)
+            if remnawave_api_token is not None:
+                value = (remnawave_api_token or '').strip() or None
+                sets.append("remnawave_api_token = ?")
+                params.append(value)
+            if squad_uuid is not None:
+                value = (squad_uuid or '').strip() or None
+                sets.append("squad_uuid = ?")
+                params.append(value)
+            if not sets:
+                return True
+            params.append(host_name_n)
+            sql = f"UPDATE xui_hosts SET {', '.join(sets)} WHERE TRIM(host_name) = TRIM(?)"
+            cursor.execute(sql, params)
+            conn.commit()
+            return True
+    except sqlite3.Error as e:
+        logging.error(f"Не удалось обновить Remnawave-настройки для хоста '{host_name}': {e}")
         return False
 
 def update_host_name(old_name: str, new_name: str) -> bool:
@@ -610,7 +1021,7 @@ def get_all_hosts() -> list[dict]:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM xui_hosts")
             hosts = cursor.fetchall()
-            # Normalize host_name in returned dicts to avoid trailing/invisible chars in runtime
+
             result = []
             for row in hosts:
                 d = dict(row)
@@ -718,12 +1129,268 @@ def insert_host_speedtest(
         logging.error(f"Не удалось сохранить запись speedtest для '{host_name}': {e}")
         return False
 
+
+
+def _ensure_ssh_targets_table(cursor: sqlite3.Cursor) -> None:
+    """Миграция: создать таблицу speedtest_ssh_targets при необходимости и добавить недостающие столбцы."""
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS speedtest_ssh_targets (
+            target_name TEXT PRIMARY KEY,
+            ssh_host TEXT NOT NULL,
+            ssh_port INTEGER DEFAULT 22,
+            ssh_user TEXT,
+            ssh_password TEXT,
+            ssh_key_path TEXT,
+            description TEXT,
+            is_active INTEGER DEFAULT 1,
+            sort_order INTEGER DEFAULT 0,
+            metadata TEXT
+        )
+    """)
+
+    extras = {
+        "ssh_host": "TEXT",
+        "ssh_port": "INTEGER",
+        "ssh_user": "TEXT",
+        "ssh_password": "TEXT",
+        "ssh_key_path": "TEXT",
+        "description": "TEXT",
+        "is_active": "INTEGER DEFAULT 1",
+        "sort_order": "INTEGER DEFAULT 0",
+        "metadata": "TEXT",
+    }
+    for column, definition in extras.items():
+        _ensure_table_column(cursor, "speedtest_ssh_targets", column, definition)
+
+
+def _ensure_gift_tokens_table(cursor: sqlite3.Cursor) -> None:
+    """Миграция для таблиц подарочных токенов."""
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS gift_tokens (
+            token TEXT PRIMARY KEY,
+            host_name TEXT NOT NULL,
+            days INTEGER NOT NULL,
+            activation_limit INTEGER DEFAULT 1,
+            activations_used INTEGER DEFAULT 0,
+            expires_at TIMESTAMP,
+            created_by INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_claimed_at TIMESTAMP,
+            comment TEXT
+        )
+        """
+    )
+    _ensure_index(cursor, "idx_gift_tokens_host", "gift_tokens", "host_name")
+    _ensure_index(cursor, "idx_gift_tokens_expires", "gift_tokens", "expires_at")
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS gift_token_claims (
+            claim_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            key_id INTEGER,
+            claimed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(token) REFERENCES gift_tokens(token) ON DELETE CASCADE
+        )
+        """
+    )
+    _ensure_index(cursor, "idx_gift_token_claims_token", "gift_token_claims", "token")
+    _ensure_index(cursor, "idx_gift_token_claims_user", "gift_token_claims", "user_id")
+
+
+def _ensure_promo_tables(cursor: sqlite3.Cursor) -> None:
+    """Создание таблиц промокодов и истории их использования."""
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS promo_codes (
+            code TEXT PRIMARY KEY,
+            discount_percent REAL,
+            discount_amount REAL,
+            usage_limit_total INTEGER,
+            usage_limit_per_user INTEGER,
+            used_total INTEGER DEFAULT 0,
+            valid_from TIMESTAMP,
+            valid_until TIMESTAMP,
+            is_active INTEGER DEFAULT 1,
+            created_by INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            description TEXT
+        )
+        """
+    )
+    _ensure_index(cursor, "idx_promo_codes_valid", "promo_codes", "valid_until")
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS promo_code_usages (
+            usage_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            applied_amount REAL,
+            order_id TEXT,
+            used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(code) REFERENCES promo_codes(code) ON DELETE CASCADE
+        )
+        """
+    )
+    _ensure_index(cursor, "idx_promo_code_usages_code", "promo_code_usages", "code")
+    _ensure_index(cursor, "idx_promo_code_usages_user", "promo_code_usages", "user_id")
+
+
+def get_all_ssh_targets() -> list[dict]:
+    """Вернуть все SSH-цели для спидтестов (включая неактивные), сортировка по sort_order, затем по имени."""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM speedtest_ssh_targets ORDER BY sort_order ASC, target_name ASC")
+            rows = cursor.fetchall()
+            return [dict(r) for r in rows]
+    except sqlite3.Error as e:
+        logging.error(f"Не удалось получить список SSH-целей: {e}")
+        return []
+
+
+def get_ssh_target(target_name: str) -> dict | None:
+    try:
+        name = normalize_host_name(target_name)
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM speedtest_ssh_targets WHERE TRIM(target_name) = TRIM(?)", (name,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+    except sqlite3.Error as e:
+        logging.error(f"Не удалось получить SSH-цель '{target_name}': {e}")
+        return None
+
+
+def create_ssh_target(
+    target_name: str,
+    ssh_host: str,
+    ssh_port: int | None = 22,
+    ssh_user: str | None = None,
+    ssh_password: str | None = None,
+    ssh_key_path: str | None = None,
+    description: str | None = None,
+    *,
+    sort_order: int | None = 0,
+    is_active: int | None = 1,
+) -> bool:
+    try:
+        name = normalize_host_name(target_name)
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO speedtest_ssh_targets
+                    (target_name, ssh_host, ssh_port, ssh_user, ssh_password, ssh_key_path, description, is_active, sort_order)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    name,
+                    (ssh_host or '').strip(),
+                    int(ssh_port) if ssh_port is not None else None,
+                    (ssh_user or None),
+                    (ssh_password if ssh_password is not None else None),
+                    (ssh_key_path or None),
+                    (description or None),
+                    1 if (is_active is None or int(is_active) != 0) else 0,
+                    int(sort_order or 0),
+                )
+            )
+            conn.commit()
+            return True
+    except sqlite3.Error as e:
+        logging.error(f"Не удалось создать SSH-цель '{target_name}': {e}")
+        return False
+
+
+def update_ssh_target_fields(
+    target_name: str,
+    *,
+    ssh_host: str | None = None,
+    ssh_port: int | None = None,
+    ssh_user: str | None = None,
+    ssh_password: str | None = None,
+    ssh_key_path: str | None = None,
+    description: str | None = None,
+    sort_order: int | None = None,
+    is_active: int | None = None,
+) -> bool:
+    try:
+        name = normalize_host_name(target_name)
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM speedtest_ssh_targets WHERE TRIM(target_name) = TRIM(?)", (name,))
+            if cursor.fetchone() is None:
+                logging.warning(f"update_ssh_target_fields: цель не найдена '{name}'")
+                return False
+            sets: list[str] = []
+            params: list[Any] = []
+            if ssh_host is not None:
+                sets.append("ssh_host = ?")
+                params.append((ssh_host or '').strip())
+            if ssh_port is not None:
+                try:
+                    val = int(ssh_port)
+                except Exception:
+                    val = None
+                sets.append("ssh_port = ?")
+                params.append(val)
+            if ssh_user is not None:
+                sets.append("ssh_user = ?")
+                params.append(ssh_user or None)
+            if ssh_password is not None:
+                sets.append("ssh_password = ?")
+                params.append(ssh_password)
+            if ssh_key_path is not None:
+                sets.append("ssh_key_path = ?")
+                params.append(ssh_key_path or None)
+            if description is not None:
+                sets.append("description = ?")
+                params.append(description or None)
+            if sort_order is not None:
+                try:
+                    so = int(sort_order)
+                except Exception:
+                    so = 0
+                sets.append("sort_order = ?")
+                params.append(so)
+            if is_active is not None:
+                sets.append("is_active = ?")
+                params.append(1 if int(is_active) != 0 else 0)
+            if not sets:
+                return True
+            params.append(name)
+            sql = f"UPDATE speedtest_ssh_targets SET {', '.join(sets)} WHERE TRIM(target_name) = TRIM(?)"
+            cursor.execute(sql, params)
+            conn.commit()
+            return True
+    except sqlite3.Error as e:
+        logging.error(f"Не удалось обновить SSH-цель '{target_name}': {e}")
+        return False
+
+
+def delete_ssh_target(target_name: str) -> bool:
+    try:
+        name = normalize_host_name(target_name)
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM speedtest_ssh_targets WHERE TRIM(target_name) = TRIM(?)", (name,))
+            affected = cursor.rowcount
+            conn.commit()
+            return affected > 0
+    except sqlite3.Error as e:
+        logging.error(f"Не удалось удалить SSH-цель '{target_name}': {e}")
+        return False
+
 def get_admin_stats() -> dict:
     """Return aggregated statistics for the admin dashboard.
     Includes:
     - total_users: count of users
     - total_keys: count of all keys
-    - active_keys: keys with expiry_date in the future
+    - active_keys: keys with expire_at in the future
     - total_income: sum of amount_rub for successful transactions
     """
     stats = {
@@ -731,7 +1398,7 @@ def get_admin_stats() -> dict:
         "total_keys": 0,
         "active_keys": 0,
         "total_income": 0.0,
-        # today's metrics
+
         "today_new_users": 0,
         "today_income": 0.0,
         "today_issued_keys": 0,
@@ -739,51 +1406,57 @@ def get_admin_stats() -> dict:
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
-            # users
+
             cursor.execute("SELECT COUNT(*) FROM users")
             row = cursor.fetchone()
             stats["total_users"] = (row[0] or 0) if row else 0
 
-            # total keys
+
             cursor.execute("SELECT COUNT(*) FROM vpn_keys")
             row = cursor.fetchone()
             stats["total_keys"] = (row[0] or 0) if row else 0
 
-            # active keys
-            cursor.execute("SELECT COUNT(*) FROM vpn_keys WHERE expiry_date > CURRENT_TIMESTAMP")
+
+            cursor.execute("SELECT COUNT(*) FROM vpn_keys WHERE expire_at IS NOT NULL AND datetime(expire_at) > CURRENT_TIMESTAMP")
             row = cursor.fetchone()
             stats["active_keys"] = (row[0] or 0) if row else 0
 
-            # income: consider common success markers (total)
+
             cursor.execute(
-                "SELECT COALESCE(SUM(amount_rub), 0) FROM transactions WHERE status IN ('paid','success','succeeded')"
+                """
+                SELECT COALESCE(SUM(amount_rub), 0)
+                FROM transactions
+                WHERE status IN ('paid','success','succeeded')
+                  AND LOWER(COALESCE(payment_method, '')) <> 'balance'
+                """
             )
             row = cursor.fetchone()
             stats["total_income"] = float(row[0] or 0.0) if row else 0.0
 
-            # today's metrics
-            # new users today
+
+
             cursor.execute(
                 "SELECT COUNT(*) FROM users WHERE date(registration_date) = date('now')"
             )
             row = cursor.fetchone()
             stats["today_new_users"] = (row[0] or 0) if row else 0
 
-            # today's income
+
             cursor.execute(
                 """
                 SELECT COALESCE(SUM(amount_rub), 0)
                 FROM transactions
                 WHERE status IN ('paid','success','succeeded')
                   AND date(created_date) = date('now')
+                  AND LOWER(COALESCE(payment_method, '')) <> 'balance'
                 """
             )
             row = cursor.fetchone()
             stats["today_income"] = float(row[0] or 0.0) if row else 0.0
 
-            # today's issued keys
+
             cursor.execute(
-                "SELECT COUNT(*) FROM vpn_keys WHERE date(created_date) = date('now')"
+                "SELECT COUNT(*) FROM vpn_keys WHERE date(COALESCE(created_at, updated_at, CURRENT_TIMESTAMP)) = date('now')"
             )
             row = cursor.fetchone()
             stats["today_issued_keys"] = (row[0] or 0) if row else 0
@@ -797,78 +1470,42 @@ def get_all_keys() -> list[dict]:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM vpn_keys")
-            return [dict(row) for row in cursor.fetchall()]
+            return [_normalize_key_row(row) for row in cursor.fetchall()]
     except sqlite3.Error as e:
         logging.error(f"Failed to get all keys: {e}")
         return []
 
-def get_keys_for_user(user_id: int) -> list[dict]:
-    try:
-        with sqlite3.connect(DB_FILE) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM vpn_keys WHERE user_id = ? ORDER BY created_date DESC", (user_id,))
-            return [dict(row) for row in cursor.fetchall()]
-    except sqlite3.Error as e:
-        logging.error(f"Failed to get keys for user {user_id}: {e}")
-        return []
 
-def get_key_by_id(key_id: int) -> dict | None:
-    try:
-        with sqlite3.connect(DB_FILE) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM vpn_keys WHERE key_id = ?", (key_id,))
-            row = cursor.fetchone()
-            return dict(row) if row else None
-    except sqlite3.Error as e:
-        logging.error(f"Failed to get key by id {key_id}: {e}")
-        return None
+def get_keys_for_user(user_id: int) -> list[dict]:
+    return get_user_keys(user_id)
 
 def update_key_email(key_id: int, new_email: str) -> bool:
-    try:
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE vpn_keys SET key_email = ? WHERE key_id = ?", (new_email, key_id))
-            conn.commit()
-            return cursor.rowcount > 0
-    except sqlite3.IntegrityError as e:
-        logging.error(f"Email uniqueness violation for key {key_id}: {e}")
-        return False
-    except sqlite3.Error as e:
-        logging.error(f"Failed to update key email for {key_id}: {e}")
-        return False
+    normalized = _normalize_email(new_email) or new_email.strip()
+    return update_key_fields(key_id, email=normalized)
 
 def update_key_host(key_id: int, new_host_name: str) -> bool:
-    try:
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE vpn_keys SET host_name = ? WHERE key_id = ?", (normalize_host_name(new_host_name), key_id))
-            conn.commit()
-            return cursor.rowcount > 0
-    except sqlite3.Error as e:
-        logging.error(f"Failed to update key host for {key_id}: {e}")
-        return False
+    return update_key_fields(key_id, host_name=new_host_name)
 
-def create_gift_key(user_id: int, host_name: str, key_email: str, months: int, xui_client_uuid: str | None = None) -> int | None:
-    """Создать подарочный ключ: задаёт expiry_date = now + months, host_name нормализуется.
-    Возвращает key_id или None при ошибке."""
+def create_gift_key(user_id: int, host_name: str, key_email: str, months: int, remnawave_user_uuid: str | None = None) -> int | None:
+    """Создать подарочный ключ: expiry = now + months."""
     try:
-        host_name = normalize_host_name(host_name)
         from datetime import timedelta
-        expiry = datetime.now() + timedelta(days=30 * int(months or 1))
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO vpn_keys (user_id, host_name, xui_client_uuid, key_email, expiry_date) VALUES (?, ?, ?, ?, ?)",
-                (user_id, host_name, xui_client_uuid or f"GIFT-{user_id}-{int(datetime.now().timestamp())}", key_email, expiry.isoformat())
-            )
-            conn.commit()
-            return cursor.lastrowid
-    except sqlite3.IntegrityError as e:
-        logging.error(f"Failed to create gift key for user {user_id}: duplicate email {key_email}: {e}")
-        return None
+
+        months_value = max(1, int(months or 1))
+        expiry_dt = datetime.utcnow() + timedelta(days=30 * months_value)
+        expiry_ms = int(expiry_dt.timestamp() * 1000)
+        uuid_value = remnawave_user_uuid or f"GIFT-{user_id}-{int(datetime.utcnow().timestamp())}"
+        return add_new_key(
+            user_id=user_id,
+            host_name=host_name,
+            remnawave_user_uuid=uuid_value,
+            key_email=key_email,
+            expiry_timestamp_ms=expiry_ms,
+        )
     except sqlite3.Error as e:
+        logging.error(f"Failed to create gift key for user {user_id}: {e}")
+        return None
+    except Exception as e:
         logging.error(f"Failed to create gift key for user {user_id}: {e}")
         return None
 
@@ -899,7 +1536,7 @@ def get_admin_ids() -> set[int]:
         multi_raw = get_setting("admin_telegram_ids")
         if multi_raw:
             s = (multi_raw or "").strip()
-            # Попробуем как JSON-массив
+
             try:
                 arr = json.loads(s)
                 if isinstance(arr, list):
@@ -911,7 +1548,7 @@ def get_admin_ids() -> set[int]:
                     return ids
             except Exception:
                 pass
-            # Иначе как строка с разделителями (запятая/пробел)
+
             parts = [p for p in re.split(r"[\s,]+", s) if p]
             for p in parts:
                 try:
@@ -928,6 +1565,187 @@ def is_admin(user_id: int) -> bool:
         return int(user_id) in get_admin_ids()
     except Exception:
         return False
+
+
+def create_payload_pending(payment_id: str, user_id: int, amount_rub: float | None, metadata: dict | None) -> bool:
+    try:
+        print(f"[DEBUG] create_payload_pending called: payment_id={payment_id}, user_id={user_id}, amount_rub={amount_rub}, metadata={metadata}")
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS pending_transactions (
+                    payment_id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    amount_rub REAL,
+                    metadata TEXT,
+                    status TEXT DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            cursor.execute(
+                '''
+                INSERT OR REPLACE INTO pending_transactions (payment_id, user_id, amount_rub, metadata, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, COALESCE((SELECT status FROM pending_transactions WHERE payment_id = ?), 'pending'),
+                        COALESCE((SELECT created_at FROM pending_transactions WHERE payment_id = ?), CURRENT_TIMESTAMP), CURRENT_TIMESTAMP)
+                '''
+                , (payment_id, int(user_id), float(amount_rub) if amount_rub is not None else None, json.dumps(metadata or {}), payment_id, payment_id)
+            )
+            conn.commit()
+            return True
+    except sqlite3.Error as e:
+        logging.error(f"Failed to create payload pending {payment_id}: {e}")
+        return False
+
+def _get_pending_metadata(payment_id: str) -> dict | None:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS pending_transactions (
+                    payment_id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    amount_rub REAL,
+                    metadata TEXT,
+                    status TEXT DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            cursor.execute("SELECT * FROM pending_transactions WHERE payment_id = ?", (payment_id,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            try:
+                meta = json.loads(row["metadata"] or "{}")
+            except Exception:
+                meta = {}
+
+            meta.setdefault('payment_id', payment_id)
+            return meta
+    except sqlite3.Error as e:
+        logging.error(f"Failed to read pending transaction {payment_id}: {e}")
+        return None
+
+
+def get_pending_metadata(payment_id: str) -> dict | None:
+    """Public wrapper to fetch pending metadata by payment_id WITHOUT marking it paid.
+    Returns metadata dict or None if not found.
+    """
+    return _get_pending_metadata(payment_id)
+
+
+def get_pending_status(payment_id: str) -> str | None:
+    """Return status of pending transaction: 'pending', 'paid', or None if not found."""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS pending_transactions (
+                    payment_id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    amount_rub REAL,
+                    metadata TEXT,
+                    status TEXT DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            cursor.execute("SELECT status FROM pending_transactions WHERE payment_id = ?", (payment_id,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return (row[0] or '').strip() or None
+    except sqlite3.Error as e:
+        logging.error(f"Failed to get status for pending {payment_id}: {e}")
+        return None
+
+def _complete_pending(payment_id: str) -> bool:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE pending_transactions SET status = 'paid', updated_at = CURRENT_TIMESTAMP WHERE payment_id = ?",
+                (payment_id,)
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+    except sqlite3.Error as e:
+        logging.error(f"Failed to complete pending transaction {payment_id}: {e}")
+        return False
+
+def find_and_complete_ton_transaction(payment_id: str, amount_ton: float | None = None) -> dict | None:
+    """Locate pending transaction by payment_id and mark it paid. Return metadata for processing.
+    The amount check is not enforced here; validation should be done on the webhook provider side.
+    """
+    meta = _get_pending_metadata(payment_id)
+    if not meta:
+        return None
+    _complete_pending(payment_id)
+    return meta
+
+def find_and_complete_pending_transaction(payment_id: str) -> dict | None:
+    logging.info(f"🔍 Ищем ожидающую транзакцию: {payment_id}")
+    meta = _get_pending_metadata(payment_id)
+    if not meta:
+        logging.warning(f"❌ Ожидающая транзакция не найдена: {payment_id}")
+        return None
+    
+    user_id = meta.get('user_id', 'неизвестно')
+    amount = meta.get('price', 0)
+    logging.info(f"✅ Найдена ожидающая транзакция: пользователь {user_id}, сумма {amount:.2f} RUB")
+    
+    success = _complete_pending(payment_id)
+    if success:
+        logging.info(f"✅ Транзакция отмечена как оплаченная: {payment_id}")
+    else:
+        logging.error(f"❌ Не удалось отметить транзакцию как оплаченную: {payment_id}")
+    return meta
+
+def get_latest_pending_for_user(user_id: int) -> dict | None:
+    """Return metadata of the most recent pending transaction for the user (without completing it)."""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS pending_transactions (
+                    payment_id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    amount_rub REAL,
+                    metadata TEXT,
+                    status TEXT DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            cursor.execute(
+                """
+                SELECT payment_id, metadata FROM pending_transactions
+                WHERE user_id = ? AND status = 'pending'
+                ORDER BY datetime(created_at) DESC, datetime(updated_at) DESC
+                LIMIT 1
+                """,
+                (int(user_id),)
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            try:
+                meta = json.loads(row["metadata"] or "{}")
+            except Exception:
+                meta = {}
+            meta.setdefault('payment_id', row["payment_id"]) 
+            return meta
+    except sqlite3.Error as e:
+        logging.error(f"Failed to read latest pending for user {user_id}: {e}")
+        return None
         
 def get_referrals_for_user(user_id: int) -> list[dict]:
     """Возвращает список пользователей, которых пригласил данный user_id.
@@ -975,6 +1793,356 @@ def update_setting(key: str, value: str):
             logging.info(f"Setting '{key}' updated.")
     except sqlite3.Error as e:
         logging.error(f"Failed to update setting '{key}': {e}")
+
+
+def get_button_configs(menu_type: str, include_inactive: bool = False) -> list[dict]:
+    """Get all button configurations for a specific menu type"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            if include_inactive:
+                query = """
+                    SELECT * FROM button_configs 
+                    WHERE menu_type = ? 
+                    ORDER BY sort_order, row_position, column_position
+                """
+            else:
+                query = """
+                    SELECT * FROM button_configs 
+                    WHERE menu_type = ? AND is_active = 1 
+                    ORDER BY sort_order, row_position, column_position
+                """
+                
+            cursor.execute(query, (menu_type,))
+            results = [dict(row) for row in cursor.fetchall()]
+
+            return results
+    except sqlite3.Error as e:
+        logging.error(f"Failed to get button configs for {menu_type}: {e}")
+        return []
+
+def get_button_config(menu_type: str, button_id: str) -> dict | None:
+    """Get a specific button configuration by menu_type and button_id"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM button_configs 
+                WHERE menu_type = ? AND button_id = ?
+            """, (menu_type, button_id))
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+            return None
+    except sqlite3.Error as e:
+        logging.error(f"Failed to get button config for {menu_type}/{button_id}: {e}")
+        return None
+
+def create_button_config(menu_type: str, button_id: str, text: str, callback_data: str = None, 
+                        url: str = None, row_position: int = 0, column_position: int = 0, 
+                        button_width: int = 1, metadata: str = None) -> bool:
+    """Create a new button configuration"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO button_configs 
+                (menu_type, button_id, text, callback_data, url, row_position, column_position, button_width, metadata, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, (menu_type, button_id, text, callback_data, url, row_position, column_position, button_width, metadata))
+            conn.commit()
+            logging.info(f"Button config created: {menu_type}/{button_id}")
+            return True
+    except sqlite3.Error as e:
+        logging.error(f"Failed to create button config: {e}")
+        return False
+
+def update_button_config(button_id: int, text: str = None, callback_data: str = None, 
+                        url: str = None, row_position: int = None, column_position: int = None, 
+                        button_width: int = None, is_active: bool = None, sort_order: int = None, metadata: str = None) -> bool:
+    """Update an existing button configuration"""
+    try:
+        logging.info(f"update_button_config called for {button_id}: text={text}, callback_data={callback_data}, url={url}, row={row_position}, col={column_position}, active={is_active}, sort={sort_order}")
+        
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            
+
+            updates = []
+            params = []
+            
+            if text is not None:
+                updates.append("text = ?")
+                params.append(text)
+            if callback_data is not None:
+                updates.append("callback_data = ?")
+                params.append(callback_data)
+            if url is not None:
+                updates.append("url = ?")
+                params.append(url)
+            if row_position is not None:
+                updates.append("row_position = ?")
+                params.append(row_position)
+            if column_position is not None:
+                updates.append("column_position = ?")
+                params.append(column_position)
+            if button_width is not None:
+                updates.append("button_width = ?")
+                params.append(button_width)
+            if is_active is not None:
+                updates.append("is_active = ?")
+                params.append(1 if is_active else 0)
+            if sort_order is not None:
+                updates.append("sort_order = ?")
+                params.append(sort_order)
+            if metadata is not None:
+                updates.append("metadata = ?")
+                params.append(metadata)
+            
+            if not updates:
+                return True
+                
+            updates.append("updated_at = CURRENT_TIMESTAMP")
+            params.append(button_id)
+            
+            query = f"UPDATE button_configs SET {', '.join(updates)} WHERE id = ?"
+            logging.info(f"Executing query: {query} with params: {params}")
+            cursor.execute(query, params)
+            
+            if cursor.rowcount == 0:
+                logging.warning(f"No button found with id {button_id}")
+                return False
+                
+            conn.commit()
+            logging.info(f"Button config {button_id} updated successfully")
+            return True
+    except sqlite3.Error as e:
+        logging.error(f"Failed to update button config {button_id}: {e}")
+        return False
+
+def delete_button_config(button_id: int) -> bool:
+    """Delete a button configuration"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM button_configs WHERE id = ?", (button_id,))
+            conn.commit()
+            logging.info(f"Button config {button_id} deleted")
+            return True
+    except sqlite3.Error as e:
+        logging.error(f"Failed to delete button config {button_id}: {e}")
+        return False
+
+def update_existing_my_keys_button():
+    """Update existing my_keys button to include key count template and set proper button widths"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+
+            cursor.execute("""
+                UPDATE button_configs 
+                SET text = '🔑 Мои ключи ({len(user_keys)})', updated_at = CURRENT_TIMESTAMP
+                WHERE menu_type = 'main_menu' AND button_id = 'my_keys'
+            """)
+            if cursor.rowcount > 0:
+                logging.info("Updated my_keys button text to include key count template")
+            
+
+            wide_buttons = [
+                ("trial", 2),
+                ("referral", 2),
+                ("admin", 2),
+            ]
+            
+            for button_id, width in wide_buttons:
+                cursor.execute("""
+                    UPDATE button_configs 
+                    SET button_width = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE menu_type = 'main_menu' AND button_id = ?
+                """, (width, button_id))
+                if cursor.rowcount > 0:
+                    logging.info(f"Updated {button_id} button width to {width}")
+            
+            conn.commit()
+    except sqlite3.Error as e:
+        logging.error(f"Failed to update button configurations: {e}")
+
+def reorder_button_configs(menu_type: str, button_orders: list[dict]) -> bool:
+    """Reorder button configurations for a menu type"""
+    try:
+        logging.info(f"Reordering {len(button_orders)} buttons for {menu_type}")
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            for order_data in button_orders:
+                button_id = order_data.get('button_id')
+                sort_order = order_data.get('sort_order', 0)
+                row_position = order_data.get('row_position', 0)
+                column_position = order_data.get('column_position', 0)
+                button_width = order_data.get('button_width', None)
+                is_active = order_data.get('is_active')
+                
+                logging.info(f"Updating {button_id}: sort={sort_order}, row={row_position}, col={column_position}, width={button_width}, active={is_active}")
+                
+                updates = [
+                    "sort_order = ?",
+                    "row_position = ?",
+                    "column_position = ?",
+                    "updated_at = CURRENT_TIMESTAMP"
+                ]
+                params = [sort_order, row_position, column_position]
+
+                if button_width is not None:
+                    # Insert before updated_at
+                    updates.insert(3, "button_width = ?")
+                    params.insert(3, int(button_width))
+                
+                if is_active is not None:
+                    # Insert before updated_at
+                    updates.insert(len(updates)-1, "is_active = ?")
+                    # Insert into params before updated_at (which is not in params, it's hardcoded in updates list)
+                    # Wait, updated_at is in updates list, but no param for it.
+                    # params corresponds to placeholders '?'
+                    # updated_at = CURRENT_TIMESTAMP has no placeholder.
+                    # So I should be careful.
+                    pass
+
+                # Let's rewrite the query construction to be safer
+                set_clauses = [
+                    "sort_order = ?",
+                    "row_position = ?",
+                    "column_position = ?",
+                    "updated_at = CURRENT_TIMESTAMP"
+                ]
+                query_params = [sort_order, row_position, column_position]
+
+                if button_width is not None:
+                    set_clauses.insert(3, "button_width = ?")
+                    query_params.insert(3, int(button_width))
+                
+                if is_active is not None:
+                    set_clauses.insert(len(set_clauses)-1, "is_active = ?")
+                    query_params.insert(len(query_params), 1 if is_active else 0)
+
+                query_params.append(menu_type)
+                query_params.append(button_id)
+
+                cursor.execute(
+                    f"""
+                    UPDATE button_configs 
+                    SET {', '.join(set_clauses)}
+                    WHERE menu_type = ? AND button_id = ?
+                    """,
+                    query_params,
+                )
+                
+                if cursor.rowcount == 0:
+                    logging.warning(f"No button found with menu_type={menu_type}, button_id={button_id}")
+                else:
+                    logging.info(f"Updated button {button_id}")
+                    
+            conn.commit()
+            logging.info(f"Button configs reordered for {menu_type}")
+            return True
+    except sqlite3.Error as e:
+        logging.error(f"Failed to reorder button configs for {menu_type}: {e}")
+        return False
+
+def initialize_default_button_configs():
+    """Initialize default button configurations for all menu types"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            
+
+            cursor.execute("SELECT COUNT(*) FROM button_configs")
+            count = cursor.fetchone()[0]
+            if count > 0:
+                logging.info("Button configs already exist, skipping initialization")
+                return True
+            
+
+            main_menu_buttons = [
+                ("trial", "🎁 Попробовать бесплатно", "get_trial", 0, 0, 0, 2),
+                ("profile", "👤 Мой профиль", "show_profile", 1, 0, 1, 1),
+                ("my_keys", "🔑 Мои ключи ({len(user_keys)})", "manage_keys", 1, 1, 2, 1),
+                ("buy_key", "🛒 Купить ключ", "buy_new_key", 2, 0, 3, 1),
+                ("topup", "💳 Пополнить баланс", "top_up_start", 2, 1, 4, 1),
+                ("referral", "🤝 Реферальная программа", "show_referral_program", 3, 0, 5, 2),
+                ("support", "🆘 Поддержка", "show_help", 4, 0, 6, 1),
+                ("about", "ℹ️ О проекте", "show_about", 4, 1, 7, 1),
+                ("speed", "⚡ Скорость", "user_speedtest_last", 5, 0, 8, 1),
+                ("howto", "❓ Как использовать", "howto_vless", 5, 1, 9, 1),
+                ("admin", "⚙️ Админка", "admin_menu", 6, 0, 10, 2),
+            ]
+            
+            for button_id, text, callback_data, row_pos, col_pos, sort_order, button_width in main_menu_buttons:
+                cursor.execute("""
+                    INSERT INTO button_configs 
+                    (menu_type, button_id, text, callback_data, row_position, column_position, sort_order, button_width, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+                """, ("main_menu", button_id, text, callback_data, row_pos, col_pos, sort_order, button_width))
+            
+
+            admin_menu_buttons = [
+                ("users", "👥 Пользователи", "admin_users", 0, 0, 0),
+                ("host_keys", "🌍 Ключи на хосте", "admin_host_keys", 0, 1, 1),
+                ("gift_key", "🎁 Выдать ключ", "admin_gift_key", 1, 0, 2),
+                ("promo", "🎟 Промокоды", "admin_promo_menu", 1, 1, 3),
+                ("speedtest", "⚡ Тест скорости", "admin_speedtest", 2, 0, 4),
+                ("monitor", "📊 Мониторинг", "admin_monitor", 2, 1, 5),
+                ("backup", "🗄 Бэкап БД", "admin_backup_db", 3, 0, 6),
+                ("restore", "♻️ Восстановить БД", "admin_restore_db", 3, 1, 7),
+                ("admins", "👮 Администраторы", "admin_admins_menu", 4, 0, 8),
+                ("broadcast", "📢 Рассылка", "start_broadcast", 4, 1, 9),
+                ("back_to_menu", "⬅️ Назад в меню", "back_to_main_menu", 5, 0, 10),
+            ]
+            
+            for button_id, text, callback_data, row_pos, col_pos, sort_order in admin_menu_buttons:
+                cursor.execute("""
+                    INSERT INTO button_configs 
+                    (menu_type, button_id, text, callback_data, row_position, column_position, sort_order, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                """, ("admin_menu", button_id, text, callback_data, row_pos, col_pos, sort_order))
+            
+
+            profile_menu_buttons = [
+                ("topup", "💳 Пополнить баланс", "top_up_start", 0, 0, 0),
+                ("referral", "🤝 Реферальная программа", "show_referral_program", 1, 0, 1),
+                ("back_to_menu", "⬅️ Назад в меню", "back_to_main_menu", 2, 0, 2),
+            ]
+            
+            for button_id, text, callback_data, row_pos, col_pos, sort_order in profile_menu_buttons:
+                cursor.execute("""
+                    INSERT INTO button_configs 
+                    (menu_type, button_id, text, callback_data, row_position, column_position, sort_order, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                """, ("profile_menu", button_id, text, callback_data, row_pos, col_pos, sort_order))
+            
+
+            support_menu_buttons = [
+                ("new_ticket", "✍️ Новое обращение", "support_new_ticket", 0, 0, 0),
+                ("my_tickets", "📨 Мои обращения", "support_my_tickets", 1, 0, 1),
+                ("external", "🆘 Внешняя поддержка", "support_external", 2, 0, 2),
+                ("back_to_menu", "⬅️ Назад в меню", "back_to_main_menu", 3, 0, 3),
+            ]
+            
+            for button_id, text, callback_data, row_pos, col_pos, sort_order in support_menu_buttons:
+                cursor.execute("""
+                    INSERT INTO button_configs 
+                    (menu_type, button_id, text, callback_data, row_position, column_position, sort_order, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                """, ("support_menu", button_id, text, callback_data, row_pos, col_pos, sort_order))
+            
+            conn.commit()
+            logging.info("Default button configurations initialized")
+            return True
+            
+    except sqlite3.Error as e:
+        logging.error(f"Failed to initialize default button configs: {e}")
+        return False
 
 def create_plan(host_name: str, plan_name: str, months: int, price: float):
     try:
@@ -1050,20 +2218,20 @@ def register_user_if_not_exists(telegram_id: int, username: str, referrer_id):
             cursor.execute("SELECT referred_by FROM users WHERE telegram_id = ?", (telegram_id,))
             row = cursor.fetchone()
             if not row:
-                # Новый пользователь — сразу сохраняем возможного реферера
+
                 cursor.execute(
                     "INSERT INTO users (telegram_id, username, registration_date, referred_by) VALUES (?, ?, ?, ?)",
                     (telegram_id, username, datetime.now(), referrer_id)
                 )
             else:
-                # Пользователь уже есть — обновим username, и если есть реферер и поле пустое, допишем
+
                 cursor.execute("UPDATE users SET username = ? WHERE telegram_id = ?", (username, telegram_id))
                 current_ref = row[0]
                 if referrer_id and (current_ref is None or str(current_ref).strip() == "") and int(referrer_id) != int(telegram_id):
                     try:
                         cursor.execute("UPDATE users SET referred_by = ? WHERE telegram_id = ?", (int(referrer_id), telegram_id))
                     except Exception:
-                        # best-effort
+
                         pass
             conn.commit()
     except sqlite3.Error as e:
@@ -1166,13 +2334,31 @@ def set_balance(user_id: int, value: float) -> bool:
 
 def add_to_balance(user_id: int, amount: float) -> bool:
     try:
+        logging.info(f"💳 Добавляем {amount:.2f} RUB к балансу пользователя {user_id}")
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
-            cursor.execute("UPDATE users SET balance = balance + ? WHERE telegram_id = ?", (amount, user_id))
+
+            cursor.execute("SELECT telegram_id, balance FROM users WHERE telegram_id = ?", (int(user_id),))
+            user_row = cursor.fetchone()
+            if not user_row:
+                logging.error(f"❌ Пользователь {user_id} не найден в базе данных")
+                return False
+            
+            old_balance = user_row[1] or 0.0
+            cursor.execute(
+                "UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE telegram_id = ?",
+                (float(amount), int(user_id))
+            )
             conn.commit()
-            return cursor.rowcount > 0
+            success = cursor.rowcount > 0
+            if success:
+                new_balance = old_balance + float(amount)
+                logging.info(f"✅ Баланс обновлен: пользователь {user_id} | {old_balance:.2f} → {new_balance:.2f} RUB (+{amount:.2f})")
+            else:
+                logging.error(f"❌ Не удалось обновить баланс для пользователя {user_id}: строки не затронуты")
+            return success
     except sqlite3.Error as e:
-        logging.error(f"Failed to add to balance for user {user_id}: {e}")
+        logging.error(f"💥 Ошибка базы данных при пополнении баланса для пользователя {user_id}: {e}")
         return False
 
 def deduct_from_balance(user_id: int, amount: float) -> bool:
@@ -1185,11 +2371,14 @@ def deduct_from_balance(user_id: int, amount: float) -> bool:
             cursor.execute("BEGIN IMMEDIATE")
             cursor.execute("SELECT balance FROM users WHERE telegram_id = ?", (user_id,))
             row = cursor.fetchone()
-            current = row[0] if row else 0.0
+            current = row[0] if row and row[0] is not None else 0.0
             if current < amount:
                 conn.rollback()
                 return False
-            cursor.execute("UPDATE users SET balance = balance - ? WHERE telegram_id = ?", (amount, user_id))
+            cursor.execute(
+                "UPDATE users SET balance = COALESCE(balance, 0) - ? WHERE telegram_id = ?",
+                (float(amount), int(user_id))
+            )
             conn.commit()
             return True
     except sqlite3.Error as e:
@@ -1245,7 +2434,7 @@ def set_terms_agreed(telegram_id: int):
             cursor = conn.cursor()
             cursor.execute("UPDATE users SET agreed_to_terms = 1 WHERE telegram_id = ?", (telegram_id,))
             conn.commit()
-            logging.info(f"User {telegram_id} has agreed to terms.")
+            logging.info(f"Пользователь {telegram_id} согласился с условиями.")
     except sqlite3.Error as e:
         logging.error(f"Failed to set terms agreed for user {telegram_id}: {e}")
 
@@ -1282,8 +2471,17 @@ def get_total_spent_sum() -> float:
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT SUM(total_spent) FROM users")
-            return cursor.fetchone()[0] or 0.0
+
+            cursor.execute(
+                """
+                SELECT COALESCE(SUM(amount_rub), 0.0)
+                FROM transactions
+                WHERE LOWER(COALESCE(status, '')) IN ('paid', 'completed', 'success')
+                  AND LOWER(COALESCE(payment_method, '')) <> 'balance'
+                """
+            )
+            val = cursor.fetchone()
+            return (val[0] if val else 0.0) or 0.0
     except sqlite3.Error as e:
         logging.error(f"Failed to get total spent sum: {e}")
         return 0.0
@@ -1311,7 +2509,7 @@ def find_and_complete_ton_transaction(payment_id: str, amount_ton: float) -> dic
             cursor.execute("SELECT * FROM transactions WHERE payment_id = ? AND status = 'pending'", (payment_id,))
             transaction = cursor.fetchone()
             if not transaction:
-                logger.warning(f"TON Webhook: Received payment for unknown or completed payment_id: {payment_id}")
+                logger.warning(f"TON Webhook: Получен платеж для неизвестного или уже обработанного payment_id: {payment_id}")
                 return None
             
             
@@ -1388,190 +2586,393 @@ def set_trial_used(telegram_id: int):
     except sqlite3.Error as e:
         logging.error(f"Failed to set trial used for user {telegram_id}: {e}")
 
-def add_new_key(user_id: int, host_name: str, xui_client_uuid: str, key_email: str, expiry_timestamp_ms: int):
+def add_new_key(
+    user_id: int,
+    host_name: str | None,
+    remnawave_user_uuid: str,
+    key_email: str,
+    expiry_timestamp_ms: int,
+    *,
+    squad_uuid: str | None = None,
+    short_uuid: str | None = None,
+    subscription_url: str | None = None,
+    traffic_limit_bytes: int | None = None,
+    traffic_limit_strategy: str | None = None,
+    description: str | None = None,
+    tag: str | None = None,
+) -> int | None:
+    host_name_norm = normalize_host_name(host_name) if host_name else None
+    email_normalized = _normalize_email(key_email) or key_email.strip()
+    expire_str = _to_datetime_str(expiry_timestamp_ms) or _now_str()
+    created_str = _now_str()
+    strategy_value = traffic_limit_strategy or "NO_RESET"
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
-            expiry_date = datetime.fromtimestamp(expiry_timestamp_ms / 1000)
             cursor.execute(
-                "INSERT INTO vpn_keys (user_id, host_name, xui_client_uuid, key_email, expiry_date) VALUES (?, ?, ?, ?, ?)",
-                (user_id, host_name, xui_client_uuid, key_email, expiry_date)
+                """
+                INSERT INTO vpn_keys (
+                    user_id,
+                    host_name,
+                    squad_uuid,
+                    remnawave_user_uuid,
+                    short_uuid,
+                    email,
+                    key_email,
+                    subscription_url,
+                    expire_at,
+                    created_at,
+                    updated_at,
+                    traffic_limit_bytes,
+                    traffic_limit_strategy,
+                    tag,
+                    description
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    host_name_norm,
+                    squad_uuid,
+                    remnawave_user_uuid,
+                    short_uuid,
+                    email_normalized,
+                    email_normalized,
+                    subscription_url,
+                    expire_str,
+                    created_str,
+                    created_str,
+                    traffic_limit_bytes,
+                    strategy_value,
+                    tag,
+                    description,
+                ),
             )
-            new_key_id = cursor.lastrowid
             conn.commit()
-            return new_key_id
+            return cursor.lastrowid
+    except sqlite3.IntegrityError as e:
+        logging.error(
+            "Failed to add new key for user %s due to integrity error: %s",
+            user_id,
+            e,
+        )
+        return None
     except sqlite3.Error as e:
-        logging.error(f"Failed to add new key for user {user_id}: {e}")
+        logging.error("Failed to add new key for user %s: %s", user_id, e)
         return None
 
-def delete_key_by_email(email: str) -> bool:
+
+def _apply_key_updates(key_id: int, updates: dict[str, Any]) -> bool:
+    if not updates:
+        return False
+    updates = dict(updates)
+    updates["updated_at"] = _now_str()
+    columns = ", ".join(f"{column} = ?" for column in updates)
+    values = list(updates.values())
+    values.append(key_id)
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM vpn_keys WHERE key_email = ?", (email,))
-            affected = cursor.rowcount
+            cursor.execute(
+                f"UPDATE vpn_keys SET {columns} WHERE key_id = ?",
+                tuple(values),
+            )
             conn.commit()
-            logger.debug(f"delete_key_by_email('{email}') affected={affected}")
-            return affected > 0
+            return cursor.rowcount > 0
     except sqlite3.Error as e:
-        logging.error(f"Failed to delete key '{email}': {e}")
+        logging.error("Failed to update key %s: %s", key_id, e)
         return False
 
-def get_user_keys(user_id: int):
+
+def update_key_fields(
+    key_id: int,
+    *,
+    host_name: str | None = None,
+    squad_uuid: str | None = None,
+    remnawave_user_uuid: str | None = None,
+    short_uuid: str | None = None,
+    email: str | None = None,
+    subscription_url: str | None = None,
+    expire_at_ms: int | None = None,
+    traffic_limit_bytes: int | None = None,
+    traffic_limit_strategy: str | None = None,
+    tag: str | None = None,
+    description: str | None = None,
+) -> bool:
+    updates: dict[str, Any] = {}
+    if host_name is not None:
+        updates["host_name"] = normalize_host_name(host_name)
+    if squad_uuid is not None:
+        updates["squad_uuid"] = squad_uuid
+    if remnawave_user_uuid is not None:
+        updates["remnawave_user_uuid"] = remnawave_user_uuid
+    if short_uuid is not None:
+        updates["short_uuid"] = short_uuid
+    if email is not None:
+        normalized = _normalize_email(email) or email.strip()
+        updates["email"] = normalized
+        updates["key_email"] = normalized
+    if subscription_url is not None:
+        updates["subscription_url"] = subscription_url
+    if expire_at_ms is not None:
+        expire_str = _to_datetime_str(expire_at_ms) or _now_str()
+        updates["expire_at"] = expire_str
+    if traffic_limit_bytes is not None:
+        updates["traffic_limit_bytes"] = traffic_limit_bytes
+    if traffic_limit_strategy is not None:
+        updates["traffic_limit_strategy"] = traffic_limit_strategy or "NO_RESET"
+    if tag is not None:
+        updates["tag"] = tag
+    if description is not None:
+        updates["description"] = description
+    return _apply_key_updates(key_id, updates)
+
+
+def delete_key_by_email(email: str) -> bool:
+    lookup = _normalize_email(email) or email.strip()
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM vpn_keys WHERE email = ? OR key_email = ?",
+                (lookup, lookup),
+            )
+            affected = cursor.rowcount
+            conn.commit()
+            logger.debug("delete_key_by_email('%s') affected=%s", email, affected)
+            return affected > 0
+    except sqlite3.Error as e:
+        logging.error("Failed to delete key '%s': %s", email, e)
+        return False
+
+
+def get_user_keys(user_id: int) -> list[dict]:
     try:
         with sqlite3.connect(DB_FILE) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM vpn_keys WHERE user_id = ? ORDER BY key_id", (user_id,))
-            keys = cursor.fetchall()
-            return [dict(key) for key in keys]
+            cursor.execute(
+                "SELECT * FROM vpn_keys WHERE user_id = ? ORDER BY datetime(created_at) DESC, key_id DESC",
+                (user_id,),
+            )
+            rows = cursor.fetchall()
+            return [_normalize_key_row(row) for row in rows]
     except sqlite3.Error as e:
-        logging.error(f"Failed to get keys for user {user_id}: {e}")
+        logging.error("Failed to get keys for user %s: %s", user_id, e)
         return []
 
-def get_key_by_id(key_id: int):
+
+def get_key_by_id(key_id: int) -> dict | None:
     try:
         with sqlite3.connect(DB_FILE) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM vpn_keys WHERE key_id = ?", (key_id,))
-            key_data = cursor.fetchone()
-            return dict(key_data) if key_data else None
+            row = cursor.fetchone()
+            return _normalize_key_row(row)
     except sqlite3.Error as e:
-        logging.error(f"Failed to get key by ID {key_id}: {e}")
+        logging.error("Failed to get key by ID %s: %s", key_id, e)
         return None
 
-def get_key_by_email(key_email: str):
+
+def get_key_by_email(key_email: str) -> dict | None:
+    lookup = _normalize_email(key_email) or key_email.strip()
     try:
         with sqlite3.connect(DB_FILE) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM vpn_keys WHERE key_email = ?", (key_email,))
-            key_data = cursor.fetchone()
-            return dict(key_data) if key_data else None
+            cursor.execute(
+                "SELECT * FROM vpn_keys WHERE email = ? OR key_email = ?",
+                (lookup, lookup),
+            )
+            row = cursor.fetchone()
+            return _normalize_key_row(row)
     except sqlite3.Error as e:
-        logging.error(f"Failed to get key by email {key_email}: {e}")
+        logging.error("Failed to get key by email %s: %s", key_email, e)
         return None
 
-def update_key_info(key_id: int, new_xui_uuid: str, new_expiry_ms: int):
+
+def get_key_by_remnawave_uuid(remnawave_uuid: str) -> dict | None:
+    if not remnawave_uuid:
+        return None
     try:
+        normalized_uuid = remnawave_uuid.strip()
         with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            expiry_date = datetime.fromtimestamp(new_expiry_ms / 1000)
-            cursor.execute("UPDATE vpn_keys SET xui_client_uuid = ?, expiry_date = ? WHERE key_id = ?", (new_xui_uuid, expiry_date, key_id))
-            conn.commit()
-    except sqlite3.Error as e:
-        logging.error(f"Failed to update key {key_id}: {e}")
- 
-def update_key_host_and_info(key_id: int, new_host_name: str, new_xui_uuid: str, new_expiry_ms: int):
-    """Update key's host, UUID and expiry in a single transaction."""
-    try:
-        new_host_name = normalize_host_name(new_host_name)
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            expiry_date = datetime.fromtimestamp(new_expiry_ms / 1000)
             cursor.execute(
-                "UPDATE vpn_keys SET host_name = ?, xui_client_uuid = ?, expiry_date = ? WHERE key_id = ?",
-                (new_host_name, new_xui_uuid, expiry_date, key_id)
+                "SELECT * FROM vpn_keys WHERE remnawave_user_uuid = ? LIMIT 1",
+                (normalized_uuid,),
             )
-            conn.commit()
+            row = cursor.fetchone()
+            return _normalize_key_row(row)
     except sqlite3.Error as e:
-        logging.error(f"Failed to update key {key_id} host and info: {e}")
+        logging.error("Failed to get key by remnawave uuid %s: %s", remnawave_uuid, e)
+        return None
+
+
+def update_key_info(key_id: int, new_remnawave_uuid: str, new_expiry_ms: int, **kwargs) -> bool:
+    return update_key_fields(
+        key_id,
+        remnawave_user_uuid=new_remnawave_uuid,
+        expire_at_ms=new_expiry_ms,
+        **kwargs,
+    )
+
+
+def update_key_host_and_info(
+    key_id: int,
+    new_host_name: str,
+    new_remnawave_uuid: str,
+    new_expiry_ms: int,
+    **kwargs,
+) -> bool:
+    return update_key_fields(
+        key_id,
+        host_name=new_host_name,
+        remnawave_user_uuid=new_remnawave_uuid,
+        expire_at_ms=new_expiry_ms,
+        **kwargs,
+    )
+
 
 def get_next_key_number(user_id: int) -> int:
-    keys = get_user_keys(user_id)
-    return len(keys) + 1
+    return len(get_user_keys(user_id)) + 1
+
 
 def get_keys_for_host(host_name: str) -> list[dict]:
     try:
-        host_name = normalize_host_name(host_name)
+        host_name_normalized = normalize_host_name(host_name)
         with sqlite3.connect(DB_FILE) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM vpn_keys WHERE TRIM(host_name) = TRIM(?)", (host_name,))
-            keys = cursor.fetchall()
-            return [dict(key) for key in keys]
+            cursor.execute(
+                "SELECT * FROM vpn_keys WHERE TRIM(host_name) = TRIM(?)",
+                (host_name_normalized,),
+            )
+            rows = cursor.fetchall()
+            return [_normalize_key_row(row) for row in rows]
     except sqlite3.Error as e:
-        logging.error(f"Failed to get keys for host '{host_name}': {e}")
+        logging.error("Failed to get keys for host '%s': %s", host_name, e)
         return []
 
-def get_all_vpn_users():
+
+def get_all_vpn_users() -> list[dict]:
     try:
         with sqlite3.connect(DB_FILE) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute("SELECT DISTINCT user_id FROM vpn_keys")
-            users = cursor.fetchall()
-            return [dict(user) for user in users]
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
     except sqlite3.Error as e:
-        logging.error(f"Failed to get all vpn users: {e}")
+        logging.error("Failed to get all vpn users: %s", e)
         return []
 
-def update_key_status_from_server(key_email: str, xui_client_data):
+
+def update_key_status_from_server(key_email: str, client_data) -> bool:
     try:
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            if xui_client_data:
-                expiry_date = datetime.fromtimestamp(xui_client_data.expiry_time / 1000)
-                cursor.execute("UPDATE vpn_keys SET xui_client_uuid = ?, expiry_date = ? WHERE key_email = ?", (xui_client_data.id, expiry_date, key_email))
+        normalized_email = _normalize_email(key_email) or key_email.strip()
+        existing = get_key_by_email(normalized_email)
+        if client_data:
+            if isinstance(client_data, dict):
+                remote_uuid = client_data.get('uuid') or client_data.get('id')
+                expire_value = client_data.get('expireAt') or client_data.get('expiryDate')
+                subscription_url = client_data.get('subscriptionUrl') or client_data.get('subscription_url')
+                expiry_ms = None
+                if expire_value:
+                    try:
+                        remote_dt = datetime.fromisoformat(str(expire_value).replace('Z', '+00:00'))
+                        expiry_ms = int(remote_dt.timestamp() * 1000)
+                    except Exception:
+                        expiry_ms = None
             else:
-                cursor.execute("DELETE FROM vpn_keys WHERE key_email = ?", (key_email,))
-            conn.commit()
+                remote_uuid = getattr(client_data, 'id', None) or getattr(client_data, 'uuid', None)
+                expiry_ms = getattr(client_data, 'expiry_time', None)
+                subscription_url = getattr(client_data, 'subscription_url', None)
+            if not existing:
+                return False
+            return update_key_fields(
+                existing['key_id'],
+                remnawave_user_uuid=remote_uuid,
+                expire_at_ms=expiry_ms,
+                subscription_url=subscription_url,
+            )
+        if existing:
+            return delete_key_by_email(normalized_email)
+        return True
     except sqlite3.Error as e:
-        logging.error(f"Failed to update key status for {key_email}: {e}")
+        logging.error("Failed to update key status for %s: %s", key_email, e)
+        return False
+
 
 def get_daily_stats_for_charts(days: int = 30) -> dict:
     stats = {'users': {}, 'keys': {}}
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
-            query_users = """
-                SELECT date(registration_date) as day, COUNT(*)
+            cursor.execute(
+                """
+                SELECT date(registration_date) AS day, COUNT(*)
                 FROM users
                 WHERE registration_date >= date('now', ?)
                 GROUP BY day
-                ORDER BY day;
-            """
-            cursor.execute(query_users, (f'-{days} days',))
-            for row in cursor.fetchall():
-                stats['users'][row[0]] = row[1]
-            
-            query_keys = """
-                SELECT date(created_date) as day, COUNT(*)
+                ORDER BY day
+                """,
+                (f'-{days} days',),
+            )
+            for day, count in cursor.fetchall():
+                stats['users'][day] = count
+
+            cursor.execute(
+                """
+                SELECT date(COALESCE(created_at, updated_at, CURRENT_TIMESTAMP)) AS day, COUNT(*)
                 FROM vpn_keys
-                WHERE created_date >= date('now', ?)
+                WHERE COALESCE(created_at, updated_at, CURRENT_TIMESTAMP) >= date('now', ?)
                 GROUP BY day
-                ORDER BY day;
-            """
-            cursor.execute(query_keys, (f'-{days} days',))
-            for row in cursor.fetchall():
-                stats['keys'][row[0]] = row[1]
+                ORDER BY day
+                """,
+                (f'-{days} days',),
+            )
+            for day, count in cursor.fetchall():
+                stats['keys'][day] = count
     except sqlite3.Error as e:
-        logging.error(f"Failed to get daily stats for charts: {e}")
+        logging.error("Failed to get daily stats for charts: %s", e)
     return stats
 
 
 def get_recent_transactions(limit: int = 15) -> list[dict]:
-    transactions = []
+    transactions: list[dict] = []
     try:
         with sqlite3.connect(DB_FILE) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            query = """
+            cursor.execute(
+                """
                 SELECT
                     k.key_id,
                     k.host_name,
-                    k.created_date,
+                    k.created_at,
                     u.telegram_id,
                     u.username
                 FROM vpn_keys k
                 JOIN users u ON k.user_id = u.telegram_id
-                ORDER BY k.created_date DESC
-                LIMIT ?;
-            """
-            cursor.execute(query, (limit,))
+                ORDER BY datetime(k.created_at) DESC, k.key_id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            for row in cursor.fetchall():
+                transactions.append(
+                    {
+                        "key_id": row["key_id"],
+                        "host_name": row["host_name"],
+                        "created_at": row["created_at"],
+                        "telegram_id": row["telegram_id"],
+                        "username": row["username"],
+                    }
+                )
     except sqlite3.Error as e:
-        logging.error(f"Failed to get recent transactions: {e}")
+        logging.error("Failed to get recent transactions: %s", e)
     return transactions
 
 
@@ -1585,6 +2986,76 @@ def get_all_users() -> list[dict]:
     except sqlite3.Error as e:
         logging.error(f"Failed to get all users: {e}")
         return []
+
+def get_users_paginated(page: int = 1, per_page: int = 30, q: str | None = None) -> tuple[list[dict], int]:
+    """Вернуть пользователей постранично и общее количество (с учётом фильтра).
+
+    Фильтр q ищет по username (LIKE) и по текстовому представлению telegram_id.
+    """
+    page = max(1, int(page or 1))
+    per_page = max(1, int(per_page or 30))
+    offset = (page - 1) * per_page
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            if q:
+                q_like = f"%{q.strip()}%"
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM users
+                    WHERE (username LIKE ?)
+                       OR (CAST(telegram_id AS TEXT) LIKE ?)
+                    """,
+                    (q_like, q_like),
+                )
+                total = cursor.fetchone()[0] or 0
+
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM users
+                    WHERE (username LIKE ?)
+                       OR (CAST(telegram_id AS TEXT) LIKE ?)
+                    ORDER BY registration_date DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (q_like, q_like, per_page, offset),
+                )
+            else:
+                cursor.execute("SELECT COUNT(*) FROM users")
+                total = cursor.fetchone()[0] or 0
+                cursor.execute(
+                    "SELECT * FROM users ORDER BY registration_date DESC LIMIT ? OFFSET ?",
+                    (per_page, offset),
+                )
+            users = [dict(row) for row in cursor.fetchall()]
+            return users, total
+    except sqlite3.Error as e:
+        logging.error(f"Failed to get users paginated: {e}")
+        return [], 0
+
+def get_keys_counts_for_users(user_ids: list[int]) -> dict[int, int]:
+    """Вернуть словарь {user_id: keys_count} по списку пользователей."""
+    result: dict[int, int] = {}
+    if not user_ids:
+        return result
+
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            placeholders = ",".join(["?"] * len(user_ids))
+            query = f"SELECT user_id, COUNT(*) AS cnt FROM vpn_keys WHERE user_id IN ({placeholders}) GROUP BY user_id"
+            cursor.execute(query, tuple(int(x) for x in user_ids))
+            for row in cursor.fetchall() or []:
+                uid = int(row[0])
+                cnt = int(row[1] or 0)
+                result[uid] = cnt
+    except sqlite3.Error as e:
+        logging.error("Failed to get keys counts for users: %s", e)
+    return result
 
 def ban_user(telegram_id: int):
     try:
@@ -1617,6 +3088,18 @@ def create_support_ticket(user_id: int, subject: str | None = None) -> int | Non
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
+
+            try:
+                cursor.execute(
+                    "SELECT ticket_id FROM support_tickets WHERE user_id = ? AND status = 'open' ORDER BY updated_at DESC LIMIT 1",
+                    (user_id,)
+                )
+                row = cursor.fetchone()
+                if row and row[0]:
+                    return int(row[0])
+            except Exception:
+                pass
+
             cursor.execute(
                 "INSERT INTO support_tickets (user_id, subject) VALUES (?, ?)",
                 (user_id, subject)
@@ -1626,6 +3109,32 @@ def create_support_ticket(user_id: int, subject: str | None = None) -> int | Non
     except sqlite3.Error as e:
         logging.error(f"Failed to create support ticket for user {user_id}: {e}")
         return None
+
+def get_or_create_open_ticket(user_id: int, subject: str | None = None) -> tuple[int | None, bool]:
+    """Возвращает ID открытого тикета пользователя и флаг, создан ли новый.
+    Если открытого тикета нет — создаёт новый и возвращает (id, True).
+    """
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+
+            cursor.execute(
+                "SELECT ticket_id FROM support_tickets WHERE user_id = ? AND status = 'open' ORDER BY updated_at DESC LIMIT 1",
+                (user_id,)
+            )
+            row = cursor.fetchone()
+            if row and row[0]:
+                return int(row[0]), False
+
+            cursor.execute(
+                "INSERT INTO support_tickets (user_id, subject) VALUES (?, ?)",
+                (user_id, subject)
+            )
+            conn.commit()
+            return int(cursor.lastrowid), True
+    except sqlite3.Error as e:
+        logging.error(f"Failed to get_or_create_open_ticket for user {user_id}: {e}")
+        return None, False
 
 def add_support_message(ticket_id: int, sender: str, content: str) -> int | None:
     try:
@@ -1820,3 +3329,6 @@ def get_all_tickets_count() -> int:
     except sqlite3.Error as e:
         logging.error("Failed to get all tickets count: %s", e)
         return 0
+
+
+

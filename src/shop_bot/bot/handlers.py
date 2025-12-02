@@ -13,56 +13,347 @@ import asyncio
 from urllib.parse import urlencode
 from hmac import compare_digest
 from functools import wraps
-from yookassa import Payment
 from io import BytesIO
+from yookassa import Payment, Configuration
 from datetime import datetime, timedelta
 from aiosend import CryptoPay, TESTNET
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict
 
 from pytonconnect import TonConnect
-from pytonconnect.exceptions import UserRejectsError
-
-from aiogram import Bot, Router, F, types, html
-from aiogram.types import BufferedInputFile
+from aiogram import Router, F, Bot, types, html
+from aiogram.types import BufferedInputFile, LabeledPrice, PreCheckoutQuery
 from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.enums import ChatMemberStatus
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-
 from shop_bot.bot import keyboards
-from shop_bot.modules import xui_api
-from shop_bot.data_manager.database import (
-    get_user, add_new_key, get_user_keys, update_user_stats,
-    register_user_if_not_exists, get_next_key_number, get_key_by_id,
-    update_key_info, set_trial_used, set_terms_agreed, get_setting, get_all_hosts,
-    get_plans_for_host, get_plan_by_id, log_transaction, get_referral_count,
-    create_pending_transaction, get_all_users,
-    create_support_ticket, add_support_message, get_user_tickets,
-    get_ticket, get_ticket_messages, set_ticket_status, update_ticket_thread_info,
-    get_ticket_by_thread,
-    update_key_host_and_info,
-    get_balance, deduct_from_balance,
-    get_key_by_email, add_to_balance,
-    add_to_referral_balance_all, get_referral_balance_all,
+from shop_bot.modules.platega_api import PlategaAPI
+from shop_bot.data_manager.remnawave_repository import (
+    add_to_balance,
+    deduct_from_balance,
+    get_setting,
+    get_user,
+    register_user_if_not_exists,
+    get_next_key_number,
+    create_payload_pending,
+    get_pending_status,
+    find_and_complete_pending_transaction,
+    get_user_keys,
+    get_balance,
+    get_referral_count,
+    get_plan_by_id,
+    get_all_hosts,
+    get_plans_for_host,
+    redeem_promo_code,
+    check_promo_code_available,
+    update_promo_code_status,
+    record_key_from_payload,
+    add_to_referral_balance_all,
+    get_referral_balance_all,
     get_referral_balance,
-    is_admin,
+    get_all_users,
+    set_terms_agreed,
     set_referral_start_bonus_received,
+    set_trial_used,
+    update_user_stats,
+    log_transaction,
+    is_admin,
 )
 
 from shop_bot.config import (
-    get_profile_text, get_vpn_active_text, VPN_INACTIVE_TEXT, VPN_NO_DATA_TEXT,
-    get_key_info_text, CHOOSE_PAYMENT_METHOD_MESSAGE, get_purchase_success_text
+    get_profile_text,
+    get_vpn_active_text,
+    VPN_INACTIVE_TEXT,
+    VPN_NO_DATA_TEXT,
+    get_key_info_text,
+    CHOOSE_PAYMENT_METHOD_MESSAGE,
+    get_purchase_success_text
 )
+from shop_bot.data_manager import remnawave_repository as rw_repo
+from shop_bot.modules import remnawave_api
 
 TELEGRAM_BOT_USERNAME = None
 PAYMENT_METHODS = None
-ADMIN_ID = None  # устаревшее: используйте is_admin()
+ADMIN_ID = None
 CRYPTO_BOT_TOKEN = get_setting("cryptobot_token")
 
 logger = logging.getLogger(__name__)
+
+async def _create_heleket_payment_request(
+    user_id: int,
+    price: float,
+    months: int,
+    host_name: str | None,
+    state_data: dict,
+) -> str | None:
+    """
+    Создание инвойса в Heleket и возврат payment URL.
+
+    Требования API:
+      - POST https://api.heleket.com/v1/payment
+      - Заголовки: merchant, sign (md5(base64(json_body)+API_KEY))
+      - Тело (минимум): { amount, currency, order_id }
+      - Дополнительно: url_callback (наш вебхук), description (положим JSON метаданных)
+    """
+
+    merchant_id = (get_setting("heleket_merchant_id") or "").strip()
+    api_key = (get_setting("heleket_api_key") or "").strip()
+    if not (merchant_id and api_key):
+        logger.error("Heleket: не заданы merchant_id/api_key в настройках.")
+        return None
+
+
+    payment_id = str(uuid.uuid4())
+
+
+    metadata = {
+        "user_id": int(user_id),
+        "months": int(months or 0),
+        "price": float(Decimal(str(price)).quantize(Decimal("0.01"))),
+        "action": state_data.get("action"),
+        "key_id": state_data.get("key_id"),
+        "host_name": host_name or state_data.get("host_name"),
+        "plan_id": state_data.get("plan_id"),
+        "customer_email": state_data.get("customer_email"),
+        "payment_method": "Heleket",
+        "payment_id": payment_id,
+        "promo_code": state_data.get("promo_code"),
+        "promo_discount": state_data.get("promo_discount"),
+    }
+
+
+    try:
+        create_payload_pending(payment_id, user_id, float(metadata["price"]), metadata)
+    except Exception as e:
+        logger.warning(f"Heleket: не удалось создать pending: {e}")
+
+
+    amount_str = f"{Decimal(str(price)).quantize(Decimal('0.01'))}"
+    body: dict = {
+        "amount": amount_str,
+        "currency": "RUB",
+        "order_id": payment_id,
+
+        "description": json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
+    }
+
+    try:
+        domain = (get_setting("domain") or "").strip()
+    except Exception:
+        domain = ""
+    if domain:
+
+
+        cb = f"{domain.rstrip('/')}/heleket-webhook"
+        body["url_callback"] = cb
+
+
+    body_json = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+    base64_payload = base64.b64encode(body_json.encode()).decode()
+    sign = hashlib.md5((base64_payload + api_key).encode()).hexdigest()
+
+    headers = {
+        "merchant": merchant_id,
+        "sign": sign,
+        "Content-Type": "application/json",
+    }
+
+    url = "https://api.heleket.com/v1/payment"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=body, timeout=20) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    logger.error(f"Heleket: HTTP {resp.status}: {text}")
+                    return None
+                data = await resp.json(content_type=None)
+
+                if isinstance(data, dict) and data.get("state") == 0:
+                    try:
+                        result = data.get("result") or {}
+                        pay_url = result.get("url")
+                        if pay_url:
+                            return pay_url
+                    except Exception:
+                        pass
+                logger.error(f"Heleket: неожиданный ответ API: {data}")
+                return None
+    except Exception as e:
+        logger.error(f"Heleket: ошибка при создании инвойса: {e}", exc_info=True)
+        return None
+
+async def _create_cryptobot_invoice(
+    user_id: int,
+    price_rub: float,
+    months: int,
+    host_name: str | None,
+    state_data: dict,
+) -> tuple[str, int] | None:
+    """
+    Создание инвойса в Crypto Pay (CryptoBot) и возврат bot_invoice_url.
+
+    Эндпоинт: POST https://pay.crypt.bot/api/createInvoice
+    Заголовки: { 'Crypto-Pay-API-Token': <token>, 'Content-Type': 'application/json' }
+
+    Мы создаём инвойс в фиате RUB, чтобы не конвертировать курсы вручную.
+    В payload записываем строку, которую ожидает наш вебхук '/cryptobot-webhook'.
+    """
+    token = (get_setting("cryptobot_token") or "").strip()
+    if not token:
+        logger.error("CryptoBot: не указан токен API в настройках.")
+        return None
+
+
+
+    action = state_data.get("action")
+    key_id = state_data.get("key_id")
+    plan_id = state_data.get("plan_id")
+    customer_email = state_data.get("customer_email")
+    pm = "CryptoBot"
+    promo_code = state_data.get("promo_code")
+    promo_discount = state_data.get("promo_discount")
+
+
+    price_str = f"{Decimal(str(price_rub)).quantize(Decimal('0.01'))}"
+    parts = [
+        str(int(user_id)),
+        str(int(months or 0)),
+        price_str,
+        str(action or ""),
+        str(key_id if key_id is not None else "None"),
+        str((host_name or state_data.get('host_name') or "")),
+        str(plan_id if plan_id is not None else "None"),
+        str(customer_email if customer_email is not None else "None"),
+        pm,
+    ]
+
+    parts.append(str(promo_code if promo_code else "None"))
+    try:
+        promo_discount_str = f"{Decimal(str(promo_discount)).quantize(Decimal('0.01'))}" if promo_discount else "0"
+    except Exception:
+        promo_discount_str = "0"
+    parts.append(promo_discount_str)
+    payload_str = ":".join(parts)
+
+    body = {
+        "amount": price_str,
+        "currency_type": "fiat",
+        "fiat": "RUB",
+        "payload": payload_str,
+
+
+    }
+
+    headers = {
+        "Crypto-Pay-API-Token": token,
+        "Content-Type": "application/json",
+    }
+
+    url = "https://pay.crypt.bot/api/createInvoice"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=body, timeout=20) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    logger.error(f"CryptoBot: HTTP {resp.status}: {text}")
+                    return None
+                data = await resp.json(content_type=None)
+
+                if isinstance(data, dict) and data.get("ok") and isinstance(data.get("result"), dict):
+                    res = data["result"]
+                    pay_url = res.get("bot_invoice_url") or res.get("invoice_url")
+                    invoice_id = res.get("invoice_id")
+                    if pay_url and invoice_id is not None:
+                        return pay_url, int(invoice_id)
+                logger.error(f"CryptoBot: неожиданный ответ API: {data}")
+                return None
+    except Exception as e:
+        logger.error(f"CryptoBot: ошибка при создании инвойса: {e}", exc_info=True)
+        return None
+
+
+    payment_id = str(uuid.uuid4())
+
+
+    metadata = {
+        "user_id": int(user_id),
+        "months": int(months or 0),
+        "price": float(Decimal(str(price)).quantize(Decimal("0.01"))),
+        "action": state_data.get("action"),
+        "key_id": state_data.get("key_id"),
+        "host_name": host_name or state_data.get("host_name"),
+        "plan_id": state_data.get("plan_id"),
+        "customer_email": state_data.get("customer_email"),
+        "payment_method": "Heleket",
+        "payment_id": payment_id,
+    }
+
+
+    try:
+        create_payload_pending(payment_id, user_id, float(metadata["price"]), metadata)
+    except Exception as e:
+        logger.warning(f"Heleket: не удалось создать pending: {e}")
+
+
+    amount_str = f"{Decimal(str(price)).quantize(Decimal('0.01'))}"
+    body: dict = {
+        "amount": amount_str,
+        "currency": "RUB",
+        "order_id": payment_id,
+
+        "description": json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
+    }
+
+    try:
+        domain = (get_setting("domain") or "").strip()
+    except Exception:
+        domain = ""
+    if domain:
+
+
+        cb = f"{domain.rstrip('/')}/heleket-webhook"
+        body["url_callback"] = cb
+
+
+    body_json = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+    base64_payload = base64.b64encode(body_json.encode()).decode()
+    sign = hashlib.md5((base64_payload + api_key).encode()).hexdigest()
+
+    headers = {
+        "merchant": merchant_id,
+        "sign": sign,
+        "Content-Type": "application/json",
+    }
+
+    url = "https://api.heleket.com/v1/payment"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=body, timeout=20) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    logger.error(f"Heleket: HTTP {resp.status}: {text}")
+                    return None
+                data = await resp.json(content_type=None)
+
+                if isinstance(data, dict) and data.get("state") == 0:
+                    try:
+                        result = data.get("result") or {}
+                        pay_url = result.get("url")
+                        if pay_url:
+                            return pay_url
+                    except Exception:
+                        pass
+                logger.error(f"Heleket: неожиданный ответ API: {data}")
+                return None
+    except Exception as e:
+        logger.error(f"Heleket: ошибка при создании инвойса: {e}", exc_info=True)
+        return None
 
 class KeyPurchase(StatesGroup):
     waiting_for_host_selection = State()
@@ -74,6 +365,7 @@ class Onboarding(StatesGroup):
 class PaymentProcess(StatesGroup):
     waiting_for_email = State()
     waiting_for_payment_method = State()
+    waiting_for_promo_code = State()
 
  
 class TopUpProcess(StatesGroup):
@@ -97,10 +389,23 @@ async def show_main_menu(message: types.Message, edit_message: bool = False):
     
     trial_available = not (user_db_data and user_db_data.get('trial_used'))
     is_admin_flag = is_admin(user_id)
+    
 
-    text = "🏠 <b>Главное меню</b>\n\nВыберите действие:"
-    keyboard = keyboards.create_main_menu_keyboard(user_keys, trial_available, is_admin_flag)
-    # Отправляем только текст без фотографии
+
+
+    text = get_setting("main_menu_text") or "🏠 <b>Главное меню</b>\n\nВыберите действие:"
+
+    try:
+        balance = get_balance(user_id)
+    except Exception:
+        balance = 0.0
+
+    try:
+        keyboard = keyboards.create_dynamic_main_menu_keyboard(user_keys, trial_available, is_admin_flag, balance)
+    except Exception as e:
+        logger.warning(f"Не удалось создать динамическую клавиатуру, используем статическую: {e}")
+        keyboard = keyboards.create_main_menu_keyboard(user_keys, trial_available, is_admin_flag, balance)
+
     if edit_message:
         try:
             await message.edit_text(text, reply_markup=keyboard)
@@ -115,7 +420,7 @@ async def process_successful_onboarding(callback: types.CallbackQuery, state: FS
     try:
         set_terms_agreed(user_id)
     except Exception as e:
-        logger.error(f"Failed to set_terms_agreed for user {user_id}: {e}")
+        logger.error(f"Не удалось установить согласие с условиями для пользователя {user_id}: {e}")
     try:
         await callback.answer()
     except Exception:
@@ -161,16 +466,16 @@ def get_user_router() -> Router:
                 potential_referrer_id = int(command.args.split('_')[1])
                 if potential_referrer_id != user_id:
                     referrer_id = potential_referrer_id
-                    logger.info(f"New user {user_id} was referred by {referrer_id}")
+                    logger.info(f"Новый пользователь {user_id} пришел по реферальной ссылке от {referrer_id}")
             except (IndexError, ValueError):
-                logger.warning(f"Invalid referral code received: {command.args}")
+                logger.warning(f"Получен неверный реферальный код: {command.args}")
                 
         register_user_if_not_exists(user_id, username, referrer_id)
         user_id = message.from_user.id
         username = message.from_user.username or message.from_user.full_name
         user_data = get_user(user_id)
 
-        # Бонус при старте для пригласившего (fixed_start_referrer): единоразово, когда новый пользователь запускает бота по реферальной ссылке
+
         try:
             reward_type = (get_setting("referral_reward_type") or "percent_purchase").strip()
         except Exception:
@@ -185,19 +490,19 @@ def get_user_router() -> Router:
                 try:
                     ok = add_to_balance(int(referrer_id), float(start_bonus))
                 except Exception as e:
-                    logger.warning(f"Referral start bonus: add_to_balance failed for referrer {referrer_id}: {e}")
+                    logger.warning(f"Реферальный стартовый бонус: не удалось добавить к балансу для реферера {referrer_id}: {e}")
                     ok = False
-                # Увеличиваем суммарный заработок по рефералке
+
                 try:
                     add_to_referral_balance_all(int(referrer_id), float(start_bonus))
                 except Exception as e:
-                    logger.warning(f"Referral start bonus: failed to increment referral_balance_all for {referrer_id}: {e}")
-                # Помечаем, что для этого нового пользователя старт уже обработан, чтобы не дублировать при повторном /start
+                    logger.warning(f"Реферальный стартовый бонус: не удалось увеличить referral_balance_all для {referrer_id}: {e}")
+
                 try:
                     set_referral_start_bonus_received(user_id)
                 except Exception:
                     pass
-                # Уведомим пригласившего
+
                 try:
                     await bot.send_message(
                         chat_id=int(referrer_id),
@@ -332,13 +637,13 @@ def get_user_router() -> Router:
         elif user_keys: vpn_status_text = VPN_INACTIVE_TEXT
         else: vpn_status_text = VPN_NO_DATA_TEXT
         final_text = get_profile_text(username, total_spent, total_months, vpn_status_text)
-        # Баланс: основной + реферальные метрики
+
         try:
             main_balance = get_balance(user_id)
         except Exception:
             main_balance = 0.0
         final_text += f"\n\n💼 <b>Основной баланс:</b> {main_balance:.0f} RUB"
-        # Реферальная информация
+
         try:
             referral_count = get_referral_count(user_id)
         except Exception:
@@ -359,6 +664,7 @@ def get_user_router() -> Router:
         await callback.answer()
         await callback.message.edit_text(
             "Введите сумму пополнения в рублях (например, 300):\nМинимум: 10 RUB, максимум: 100000 RUB",
+            reply_markup=keyboards.create_back_to_menu_keyboard()
         )
         await state.set_state(TopUpProcess.waiting_for_amount)
 
@@ -368,16 +674,16 @@ def get_user_router() -> Router:
         try:
             amount = Decimal(text)
         except Exception:
-            await message.answer("❌ Введите корректную сумму, например: 300")
+            await message.answer("❌ Введите корректную сумму, например: 300", reply_markup=keyboards.create_back_to_menu_keyboard())
             return
         if amount <= 0:
-            await message.answer("❌ Сумма должна быть положительной")
+            await message.answer("❌ Сумма должна быть положительной", reply_markup=keyboards.create_back_to_menu_keyboard())
             return
         if amount < Decimal("10"):
-            await message.answer("❌ Минимальная сумма пополнения: 10 RUB")
+            await message.answer("❌ Минимальная сумма пополнения: 10 RUB", reply_markup=keyboards.create_back_to_menu_keyboard())
             return
         if amount > Decimal("100000"):
-            await message.answer("❌ Максимальная сумма пополнения: 100000 RUB")
+            await message.answer("❌ Максимальная сумма пополнения: 100000 RUB", reply_markup=keyboards.create_back_to_menu_keyboard())
             return
         final_amount = amount.quantize(Decimal("0.01"))
         await state.update_data(topup_amount=float(final_amount))
@@ -390,6 +696,19 @@ def get_user_router() -> Router:
     @user_router.callback_query(TopUpProcess.waiting_for_topup_method, F.data == "topup_pay_yookassa")
     async def topup_pay_yookassa(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("Создаю ссылку на оплату...")
+        
+        # Ensure YooKassa configuration is set
+        yookassa_shop_id = get_setting("yookassa_shop_id")
+        yookassa_secret_key = get_setting("yookassa_secret_key")
+        
+        if not yookassa_shop_id or not yookassa_secret_key:
+            await callback.message.answer("❌ YooKassa не настроен. Обратитесь к администратору.")
+            await state.clear()
+            return
+            
+        Configuration.account_id = yookassa_shop_id
+        Configuration.secret_key = yookassa_secret_key
+        
         data = await state.get_data()
         amount = Decimal(str(data.get('topup_amount', 0)))
         if amount <= 0:
@@ -401,7 +720,7 @@ def get_user_router() -> Router:
         price_float_for_metadata = float(amount)
 
         try:
-            # Сформируем чек, если указан email для чеков
+
             customer_email = get_setting("receipt_email")
             receipt = None
             if customer_email and is_valid_email(customer_email):
@@ -411,7 +730,9 @@ def get_user_router() -> Router:
                         "description": f"Пополнение баланса",
                         "quantity": "1.00",
                         "amount": {"value": price_str_for_api, "currency": "RUB"},
-                        "vat_code": "1"
+                        "vat_code": "1",
+                        "payment_subject": "service",
+                        "payment_mode": "full_payment"
                     }]
                 }
 
@@ -436,11 +757,497 @@ def get_user_router() -> Router:
                 reply_markup=keyboards.create_payment_keyboard(payment.confirmation.confirmation_url)
             )
         except Exception as e:
-            logger.error(f"Failed to create YooKassa topup payment: {e}", exc_info=True)
+            logger.error(f"Не удалось создать платеж пополнения YooKassa: {e}", exc_info=True)
             await callback.message.answer("Не удалось создать ссылку на оплату.")
             await state.clear()
 
-    @user_router.callback_query(TopUpProcess.waiting_for_topup_method, (F.data == "topup_pay_cryptobot") | (F.data == "topup_pay_heleket"))
+
+    @user_router.callback_query(PaymentProcess.waiting_for_payment_method, F.data == "pay_stars")
+    async def create_stars_invoice_handler(callback: types.CallbackQuery, state: FSMContext):
+        await callback.answer("Готовлю счёт в Telegram Stars...")
+        data = await state.get_data()
+        plan = get_plan_by_id(data.get('plan_id'))
+        if not plan:
+            await callback.message.edit_text("❌ Ошибка: Тариф не найден.")
+            await state.clear()
+            return
+        user_id = callback.from_user.id
+
+        price_rub = Decimal(str(data.get('final_price', plan['price'])))
+        try:
+            stars_ratio_raw = get_setting("stars_per_rub") or '0'
+            stars_ratio = Decimal(stars_ratio_raw)
+        except Exception:
+            stars_ratio = Decimal('0')
+        if stars_ratio <= 0:
+            await callback.message.edit_text("❌ Оплата в Stars временно недоступна.")
+            await state.clear()
+            return
+
+        stars_amount = int((price_rub * stars_ratio).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+        if stars_amount <= 0:
+            stars_amount = 1
+
+        payment_id = str(uuid.uuid4())
+        metadata = {
+            "user_id": user_id,
+            "months": int(plan['months']),
+            "price": float(price_rub),
+            "action": data.get('action'),
+            "key_id": data.get('key_id'),
+            "host_name": data.get('host_name'),
+            "plan_id": data.get('plan_id'),
+            "customer_email": data.get('customer_email'),
+            "payment_method": "Telegram Stars",
+            "payment_id": payment_id,
+        }
+        try:
+            ok = create_payload_pending(payment_id, user_id, float(price_rub), metadata)
+            logger.info(f"Создано ожидание Stars: ok={ok}, payment_id={payment_id}, user_id={user_id}, price_rub={price_rub}")
+        except Exception as e:
+            logger.error(f"Не удалось создать ожидание для Stars payment_id={payment_id}: {e}", exc_info=True)
+
+        title = f"Подписка на {int(plan['months'])} мес."
+        description = f"Оплата подписки на {int(plan['months'])} мес."
+        try:
+            await callback.message.answer_invoice(
+                title=title,
+                description=description,
+                prices=[LabeledPrice(label=title, amount=stars_amount)],
+                payload=payment_id,
+                currency="XTR",
+            )
+            await state.clear()
+        except Exception as e:
+            logger.error(f"Не удалось создать счет Stars: {e}")
+            await callback.message.edit_text("❌ Не удалось создать счёт в Stars. Попробуйте другой способ оплаты.")
+            await state.clear()
+
+    @user_router.callback_query(TopUpProcess.waiting_for_topup_method, F.data == "topup_pay_stars")
+    async def topup_stars_handler(callback: types.CallbackQuery, state: FSMContext):
+        await callback.answer("Готовлю счёт в Telegram Stars...")
+        data = await state.get_data()
+        user_id = callback.from_user.id
+        amount_rub = Decimal(str(data.get('topup_amount', 0)))
+        if amount_rub <= 0:
+            await callback.message.edit_text("❌ Некорректная сумма пополнения.")
+            await state.clear()
+            return
+        try:
+            stars_ratio_raw = get_setting("stars_per_rub") or '0'
+            stars_ratio = Decimal(stars_ratio_raw)
+        except Exception:
+            stars_ratio = Decimal('0')
+        if stars_ratio <= 0:
+            await callback.message.edit_text("❌ Оплата в Stars временно недоступна.")
+            await state.clear()
+            return
+        stars_amount = int((amount_rub * stars_ratio).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+        if stars_amount <= 0:
+            stars_amount = 1
+        payment_id = str(uuid.uuid4())
+        metadata = {
+            "user_id": user_id,
+            "price": float(amount_rub),
+            "action": "top_up",
+            "payment_method": "Telegram Stars",
+            "payment_id": payment_id,
+        }
+        try:
+            ok = create_payload_pending(payment_id, user_id, float(amount_rub), metadata)
+            logger.info(f"Создано ожидание пополнения Stars: ok={ok}, payment_id={payment_id}, user_id={user_id}, amount_rub={amount_rub}")
+        except Exception as e:
+            logger.error(f"Не удалось создать ожидание для пополнения Stars payment_id={payment_id}: {e}", exc_info=True)
+        try:
+            await callback.message.answer_invoice(
+                title="Пополнение баланса",
+                description=f"Пополнение на {amount_rub:.2f} RUB",
+                prices=[LabeledPrice(label="Пополнение", amount=stars_amount)],
+                payload=payment_id,
+                currency="XTR",
+            )
+            await state.clear()
+        except Exception as e:
+            logger.error(f"Не удалось создать счет пополнения Stars: {e}")
+            await callback.message.edit_text("❌ Не удалось создать счёт в Stars.")
+            await state.clear()
+
+
+    @user_router.pre_checkout_query()
+    async def pre_checkout_handler(pre_checkout_q: PreCheckoutQuery):
+        try:
+            await pre_checkout_q.answer(ok=True)
+        except Exception:
+            pass
+
+
+    @user_router.message(F.successful_payment)
+    async def stars_success_handler(message: types.Message, bot: Bot):
+        try:
+            payload = message.successful_payment.invoice_payload if message.successful_payment else None
+        except Exception:
+            payload = None
+        if not payload:
+            return
+        metadata = find_and_complete_pending_transaction(payload)
+        if not metadata:
+            logger.warning(f"Платеж Stars: метаданные не найдены для payload {payload}")
+
+            try:
+                fallback = get_latest_pending_for_user(message.from_user.id)
+            except Exception as e:
+                fallback = None
+                logger.error(f"Платеж Stars: не удалось найти резервные данные для пользователя {message.from_user.id}: {e}", exc_info=True)
+            if fallback and (fallback.get('payment_method') == 'Telegram Stars'):
+                pid = fallback.get('payment_id') or payload
+                logger.info(f"Платеж Stars: используем резервные данные для пользователя {message.from_user.id}, pid={pid}")
+                metadata = find_and_complete_pending_transaction(pid)
+        if not metadata:
+
+            try:
+                total_stars = int(getattr(message.successful_payment, 'total_amount', 0) or 0)
+            except Exception:
+                total_stars = 0
+            try:
+                stars_ratio_raw = get_setting("stars_per_rub") or '0'
+                stars_ratio = Decimal(stars_ratio_raw)
+            except Exception:
+                stars_ratio = Decimal('0')
+            if total_stars > 0 and stars_ratio > 0:
+                amount_rub = (Decimal(total_stars) / stars_ratio).quantize(Decimal('0.01'))
+                metadata = {
+                    "user_id": message.from_user.id,
+                    "price": float(amount_rub),
+                    "action": "top_up",
+                    "payment_method": "Telegram Stars",
+                    "payment_id": payload,
+                }
+                logger.info(f"Платеж Stars: восстанавливаем пополнение из total_stars={total_stars}, ratio={stars_ratio}, amount_rub={amount_rub}")
+            else:
+
+                logger.warning("Платеж Stars: не удалось восстановить метаданные платежа; пропускаем")
+                return
+
+        try:
+            if message.from_user and message.from_user.username:
+                metadata.setdefault('tg_username', message.from_user.username)
+        except Exception:
+            pass
+        await process_successful_payment(bot, metadata)
+
+
+    def _build_yoomoney_link(receiver: str, amount_rub: Decimal, label: str) -> str:
+        base = "https://yoomoney.ru/quickpay/confirm.xml"
+        params = {
+            "receiver": (receiver or "").strip(),
+            "quickpay-form": "donate",
+            "targets": "Оплата подписки",
+            "formcomment": "Оплата подписки",
+            "short-dest": "Оплата подписки",
+            "sum": f"{amount_rub:.2f}",
+            "label": label,
+            "successURL": f"https://t.me/{TELEGRAM_BOT_USERNAME}",
+
+        }
+        url = base + "?" + urlencode(params)
+        return url
+
+    @user_router.callback_query(PaymentProcess.waiting_for_payment_method, F.data == "pay_yoomoney")
+    async def pay_yoomoney_handler(callback: types.CallbackQuery, state: FSMContext):
+        await callback.answer("Готовлю ссылку YooMoney...")
+        data = await state.get_data()
+        plan = get_plan_by_id(data.get('plan_id'))
+        if not plan:
+            await callback.message.edit_text("❌ Ошибка: Тариф не найден.")
+            await state.clear()
+            return
+        wallet = get_setting("yoomoney_wallet")
+        secret = get_setting("yoomoney_secret")
+        if not wallet or not secret:
+            await callback.message.edit_text("❌ YooMoney временно недоступен.")
+            await state.clear()
+            return
+
+        w = (wallet or "").strip()
+        if not (w.isdigit() and len(w) >= 11):
+            await callback.message.edit_text("❌ Некорректный номер кошелька YooMoney. Проверьте в панели настроек.")
+            await state.clear()
+            return
+        price_rub = Decimal(str(data.get('final_price', plan['price'])))
+        if price_rub < Decimal("1.00"):
+            await callback.message.edit_text("❌ Минимальная сумма перевода YooMoney — 1 RUB. Выберите другой тариф или способ оплаты.")
+            await state.clear()
+            return
+        user_id = callback.from_user.id
+        payment_id = str(uuid.uuid4())
+        metadata = {
+            "user_id": user_id,
+            "months": int(plan['months']),
+            "price": float(price_rub),
+            "action": data.get('action'),
+            "key_id": data.get('key_id'),
+            "host_name": data.get('host_name'),
+            "plan_id": data.get('plan_id'),
+            "customer_email": data.get('customer_email'),
+            "payment_method": "YooMoney",
+            "payment_id": payment_id,
+        }
+        create_payload_pending(payment_id, user_id, float(price_rub), metadata)
+        pay_url = _build_yoomoney_link(wallet, price_rub, payment_id)
+        await callback.message.edit_text(
+            "Нажмите на кнопку ниже для оплаты:",
+            reply_markup=keyboards.create_yoomoney_payment_keyboard(pay_url, payment_id)
+        )
+        await state.clear()
+
+    @user_router.callback_query(TopUpProcess.waiting_for_topup_method, F.data == "topup_pay_yoomoney")
+    async def topup_yoomoney_handler(callback: types.CallbackQuery, state: FSMContext):
+        user_id = callback.from_user.id
+        logger.info(f"💜 Пользователь {user_id} инициировал платеж через ЮMoney")
+        
+        await callback.answer("Готовлю YooMoney...")
+        data = await state.get_data()
+        amount_rub = Decimal(str(data.get('topup_amount', 0)))
+        wallet = get_setting("yoomoney_wallet")
+        secret = get_setting("yoomoney_secret")
+        
+        logger.info(f"💰 Детали платежа: сумма={amount_rub:.2f} RUB, кошелек={wallet}")
+        
+        if not wallet or not secret or amount_rub <= 0:
+            logger.warning(f"❌ ЮMoney недоступен: кошелек={bool(wallet)}, секрет={bool(secret)}, сумма={amount_rub}")
+            await callback.message.edit_text("❌ YooMoney временно недоступен.")
+            await state.clear()
+            return
+        w = (wallet or "").strip()
+        if not (w.isdigit() and len(w) >= 11):
+            logger.warning(f"❌ Неверный формат кошелька: {w}")
+            await callback.message.edit_text("❌ Некорректный номер кошелька YooMoney. Проверьте в панели настроек.")
+            await state.clear()
+            return
+        if amount_rub < Decimal("1.00"):
+            logger.warning(f"❌ Сумма слишком мала: {amount_rub}")
+            await callback.message.edit_text("❌ Минимальная сумма перевода YooMoney — 1 RUB. Введите сумму побольше.")
+            await state.clear()
+            return
+        
+        payment_id = str(uuid.uuid4())
+        metadata = {
+            "user_id": user_id,
+            "price": float(amount_rub),
+            "action": "top_up",
+            "payment_method": "YooMoney",
+            "payment_id": payment_id,
+        }
+        
+        logger.info(f"📝 Создаем ожидающую транзакцию: {payment_id}")
+        create_payload_pending(payment_id, user_id, float(amount_rub), metadata)
+        pay_url = _build_yoomoney_link(wallet, amount_rub, payment_id)
+        
+        logger.info(f"🔗 Сгенерирован URL платежа для пользователя {user_id}: {amount_rub:.2f} RUB")
+        await callback.message.edit_text(
+            "Нажмите на кнопку ниже для оплаты:",
+            reply_markup=keyboards.create_yoomoney_payment_keyboard(pay_url, payment_id)
+        )
+        await state.clear()
+
+    @user_router.callback_query(F.data.startswith("check_pending:"))
+    async def check_pending_payment_handler(callback: types.CallbackQuery, bot: Bot):
+        try:
+            pid = callback.data.split(":", 1)[1]
+        except Exception:
+            await callback.answer("Некорректный идентификатор платежа.", show_alert=True)
+            return
+        
+        logger.info(f"🔍 Проверяем статус платежа: {pid}")
+        
+        try:
+            status = get_pending_status(pid) or ""
+            logger.info(f"📊 Локальный статус: {status}")
+        except Exception as e:
+            logger.error(f"❌ Ошибка проверки локального статуса для {pid}: {e}")
+            status = ""
+        if status and status.lower() == 'paid':
+            logger.info(f"✅ Платеж уже обработан локально: {pid}")
+            await callback.answer("✅ Оплата получена! Профиль/баланс скоро обновится.", show_alert=True)
+            return
+
+
+        token = (get_setting('yoomoney_api_token') or '').strip()
+        if not token:
+            logger.warning(f"⚠️ Нет токена API ЮMoney для платежа {pid}")
+            if not status:
+                await callback.answer("❌ Платёж не найден. Проверьте позже.", show_alert=True)
+            else:
+                await callback.answer("⏳ Оплата ещё не поступила. Попробуйте через минуту.", show_alert=True)
+            return
+
+        try:
+            logger.info(f"🌐 Проверяем платеж через API ЮMoney: {pid}")
+            async with aiohttp.ClientSession() as session:
+                data = {"label": pid, "records": "10"}
+                headers = {
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                }
+                async with session.post("https://yoomoney.ru/api/operation-history", data=data, headers=headers, timeout=15) as resp:
+                    text = await resp.text()
+                    logger.info(f"📡 Ответ API: статус={resp.status}")
+                    if resp.status != 200:
+                        await callback.answer("⚠️ Не удалось проверить оплату через YooMoney. Попробуйте позже.", show_alert=True)
+                        return
+        except Exception as e:
+            logger.error(f"💥 Ошибка проверки API для {pid}: {e}")
+            await callback.answer("⚠️ Ошибка связи с YooMoney. Попробуйте позже.", show_alert=True)
+            return
+        try:
+            payload = json.loads(text)
+        except Exception as e:
+            logger.error(f"💥 Не удалось разобрать ответ API: {e}")
+            payload = {}
+        ops = payload.get('operations') or []
+        logger.info(f"📋 Найдено операций: {len(ops)}")
+        paid = False
+        for op in ops:
+            try:
+                op_label = str(op.get('label'))
+                op_status = str(op.get('status','')).lower()
+                if op_label == pid and op_status in {"success","done"}:
+                    paid = True
+                    logger.info(f"✅ Найдена оплаченная операция: {op_label} | {op_status}")
+                    break
+            except Exception as e:
+                logger.warning(f"⚠️ Ошибка обработки операции: {e}")
+                continue
+        if paid:
+            logger.info(f"🎉 Платеж подтвержден через API, обрабатываем: {pid}")
+            try:
+                metadata = find_and_complete_pending_transaction(pid)
+            except Exception as e:
+                logger.error(f"💥 Ошибка поиска ожидающей транзакции: {e}")
+                metadata = None
+            if metadata:
+                try:
+                    await process_successful_payment(bot, metadata)
+                except Exception as e:
+                    logger.error(f"💥 Ошибка в process_successful_payment: {e}")
+            await callback.answer("✅ Оплата получена! Профиль/баланс скоро обновится.", show_alert=True)
+            return
+
+        logger.info(f"⏳ Платеж не найден или еще не оплачен: {pid}")
+        await callback.answer("⏳ Оплата ещё не поступила. Попробуйте через минуту.", show_alert=True)
+
+    @user_router.callback_query(PaymentProcess.waiting_for_payment_method, F.data == "pay_platega")
+    async def pay_platega_handler(callback: types.CallbackQuery, state: FSMContext):
+        await callback.answer("Создаю ссылку на оплату через СБП...")
+        data = await state.get_data()
+        plan = get_plan_by_id(data.get('plan_id'))
+        if not plan:
+            await callback.message.edit_text("❌ Ошибка: Тариф не найден.")
+            await state.clear()
+            return
+        
+        merchant_id = get_setting("platega_merchant_id")
+        api_key = get_setting("platega_api_key")
+        if not merchant_id or not api_key:
+            await callback.message.edit_text("❌ Platega временно недоступен.")
+            await state.clear()
+            return
+        
+        price_rub = Decimal(str(data.get('final_price', plan['price'])))
+        user_id = callback.from_user.id
+        payment_id = str(uuid.uuid4())
+        
+        metadata = {
+            "user_id": user_id,
+            "months": int(plan['months']),
+            "price": float(price_rub),
+            "action": data.get('action'),
+            "key_id": data.get('key_id'),
+            "host_name": data.get('host_name'),
+            "plan_id": data.get('plan_id'),
+            "customer_email": data.get('customer_email'),
+            "payment_method": "Platega",
+            "payment_id": payment_id,
+        }
+        
+        try:
+            create_payload_pending(payment_id, user_id, float(price_rub), metadata)
+            platega = PlategaAPI(merchant_id, api_key)
+            transaction_id, payment_url = await platega.create_payment(
+                amount=float(price_rub),
+                description=f"Оплата подписки на {int(plan['months'])} мес.",
+                payment_id=payment_id,
+                return_url=f"https://t.me/{TELEGRAM_BOT_USERNAME}",
+                failed_url=f"https://t.me/{TELEGRAM_BOT_USERNAME}",
+                payment_method=2  # СБП/QR
+            )
+            
+            if payment_url:
+                await callback.message.edit_text(
+                    "Нажмите на кнопку ниже для оплаты:",
+                    reply_markup=keyboards.create_payment_keyboard(payment_url)
+                )
+                await state.clear()
+            else:
+                await callback.message.edit_text("❌ Не удалось создать ссылку на оплату. Попробуйте другой способ.")
+                await state.clear()
+        except Exception as e:
+            logger.error(f"Ошибка создания платежа Platega: {e}", exc_info=True)
+            await callback.message.edit_text("❌ Не удалось создать ссылку на оплату.")
+            await state.clear()
+
+    @user_router.callback_query(TopUpProcess.waiting_for_topup_method, F.data == "topup_pay_platega")
+    async def topup_platega_handler(callback: types.CallbackQuery, state: FSMContext):
+        await callback.answer("Создаю ссылку на оплату через СБП...")
+        data = await state.get_data()
+        user_id = callback.from_user.id
+        amount_rub = Decimal(str(data.get('topup_amount', 0)))
+        
+        merchant_id = get_setting("platega_merchant_id")
+        api_key = get_setting("platega_api_key")
+        
+        if not merchant_id or not api_key or amount_rub <= 0:
+            await callback.message.edit_text("❌ Platega временно недоступен.")
+            await state.clear()
+            return
+        
+        payment_id = str(uuid.uuid4())
+        metadata = {
+            "user_id": user_id,
+            "price": float(amount_rub),
+            "action": "top_up",
+            "payment_method": "Platega",
+            "payment_id": payment_id,
+        }
+        
+        try:
+            create_payload_pending(payment_id, user_id, float(amount_rub), metadata)
+            platega = PlategaAPI(merchant_id, api_key)
+            transaction_id, payment_url = await platega.create_payment(
+                amount=float(amount_rub),
+                description=f"Пополнение баланса на {amount_rub:.2f} RUB",
+                payment_id=payment_id,
+                return_url=f"https://t.me/{TELEGRAM_BOT_USERNAME}",
+                failed_url=f"https://t.me/{TELEGRAM_BOT_USERNAME}",
+                payment_method=2  # СБП/QR
+            )
+            
+            if payment_url:
+                await callback.message.edit_text(
+                    "Нажмите на кнопку ниже для оплаты:",
+                    reply_markup=keyboards.create_payment_keyboard(payment_url)
+                )
+                await state.clear()
+            else:
+                await callback.message.edit_text("❌ Не удалось создать ссылку на оплату. Попробуйте другой способ.")
+                await state.clear()
+        except Exception as e:
+            logger.error(f"Ошибка создания пополнения Platega: {e}", exc_info=True)
+            await callback.message.edit_text("❌ Не удалось создать ссылку на оплату.")
+            await state.clear()
+
+    @user_router.callback_query(TopUpProcess.waiting_for_topup_method, F.data == "topup_pay_heleket")
     async def topup_pay_heleket_like(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("Создаю счёт...")
         data = await state.get_data()
@@ -450,7 +1257,7 @@ def get_user_router() -> Router:
             await callback.message.edit_text("❌ Некорректная сумма пополнения. Повторите ввод.")
             await state.clear()
             return
-        # Сформируем state_data минимально необходимым
+
         state_data = {
             "action": "top_up",
             "customer_email": None,
@@ -477,6 +1284,45 @@ def get_user_router() -> Router:
         except Exception as e:
             logger.error(f"Failed to create topup Heleket-like invoice: {e}", exc_info=True)
             await callback.message.edit_text("❌ Не удалось создать счёт. Попробуйте другой способ оплаты.")
+            await state.clear()
+
+    @user_router.callback_query(TopUpProcess.waiting_for_topup_method, F.data == "topup_pay_cryptobot")
+    async def topup_pay_cryptobot(callback: types.CallbackQuery, state: FSMContext):
+        await callback.answer("Создаю счёт в Crypto Pay...")
+        data = await state.get_data()
+        user_id = callback.from_user.id
+        amount = float(data.get('topup_amount', 0))
+        if amount <= 0:
+            await callback.message.edit_text("❌ Некорректная сумма пополнения. Повторите ввод.")
+            await state.clear()
+            return
+        state_data = {
+            "action": "top_up",
+            "customer_email": None,
+            "plan_id": None,
+            "host_name": None,
+            "key_id": None,
+        }
+        try:
+            result = await _create_cryptobot_invoice(
+                user_id=user_id,
+                price_rub=float(amount),
+                months=0,
+                host_name="",
+                state_data=state_data,
+            )
+            if result:
+                pay_url, invoice_id = result
+                await callback.message.edit_text(
+                    "Нажмите на кнопку ниже для оплаты:",
+                    reply_markup=keyboards.create_cryptobot_payment_keyboard(pay_url, invoice_id)
+                )
+                await state.clear()
+            else:
+                await callback.message.edit_text("❌ Не удалось создать счёт в CryptoBot. Попробуйте другой способ оплаты.")
+        except Exception as e:
+            logger.error(f"Failed to create CryptoBot topup invoice: {e}", exc_info=True)
+            await callback.message.edit_text("❌ Не удалось создать счёт в CryptoBot. Попробуйте другой способ оплаты.")
             await state.clear()
 
     @user_router.callback_query(TopUpProcess.waiting_for_topup_method, F.data == "topup_pay_tonconnect")
@@ -590,6 +1436,58 @@ def get_user_router() -> Router:
             reply_markup=keyboard,
             disable_web_page_preview=True
         )
+
+
+    @user_router.callback_query(F.data == "user_speedtest_last")
+    @registration_required
+    async def user_speedtest_last_handler(callback: types.CallbackQuery):
+        await callback.answer()
+        try:
+            targets = rw_repo.get_all_ssh_targets() or []
+        except Exception:
+            targets = []
+        lines = []
+        for t in targets:
+            name = (t.get('target_name') or '').strip()
+            if not name:
+                continue
+            try:
+                last = rw_repo.get_latest_speedtest(name)
+            except Exception:
+                last = None
+            if not last:
+                lines.append(f"• <b>{name}</b>: данных нет")
+                continue
+            ping = last.get('ping_ms')
+            down = last.get('download_mbps')
+            up = last.get('upload_mbps')
+            ok_badge = '✅' if last.get('ok') else '❌'
+            ping_s = f"{float(ping):.2f}" if isinstance(ping, (int, float)) else '—'
+            down_s = f"{float(down):.0f}" if isinstance(down, (int, float)) else '—'
+            up_s = f"{float(up):.0f}" if isinstance(up, (int, float)) else '—'
+            ts_raw = last.get('created_at') or ''
+            ts_s = ''
+            if ts_raw:
+                try:
+                    dt = datetime.fromisoformat(str(ts_raw).replace('Z', '+00:00'))
+
+                    ts_s = dt.strftime('%d.%m %H:%M')
+                except Exception:
+                    ts_s = str(ts_raw)
+
+            lines.append(
+                f"• <b>{name}</b> — SSH: {ok_badge} · ⏱ {ping_s} ms · ↓ {down_s} Mbps · ↑ {up_s} Mbps · 🕒 {ts_s}"
+            )
+        text = (
+            "⚡ <b>Последние результаты Speedtest</b>\n"
+            + ("\n\n".join(lines) if lines else "(цели не настроены)")
+        )
+        kb = InlineKeyboardBuilder()
+        kb.button(text="⬅️ В меню", callback_data="back_to_main_menu")
+        try:
+            await callback.message.edit_text(text, reply_markup=kb.as_markup())
+        except Exception:
+            await callback.message.answer(text, reply_markup=kb.as_markup())
 
     @user_router.callback_query(F.data == "show_help")
     @registration_required
@@ -762,7 +1660,7 @@ def get_user_router() -> Router:
             user_id = int(ticket.get('user_id'))
             if message.from_user and message.from_user.id == me.id:
                 return
-            # Проверка многоадминная
+
             is_admin_by_setting = is_admin(message.from_user.id)
             is_admin_in_chat = False
             try:
@@ -852,7 +1750,7 @@ def get_user_router() -> Router:
         await message.edit_text(f"Отлично! Создаю для вас бесплатный ключ на {get_setting('trial_duration_days')} дня на сервере \"{host_name}\"...")
 
         try:
-            # email: trial_{username}@bot.local с авто-суффиксом при коллизиях
+
             user_data = get_user(user_id) or {}
             raw_username = (user_data.get('username') or f'user{user_id}').lower()
             username_slug = re.sub(r"[^a-z0-9._-]", "_", raw_username).strip("_")[:16] or f"user{user_id}"
@@ -861,7 +1759,7 @@ def get_user_router() -> Router:
             attempt = 1
             while True:
                 candidate_email = f"{candidate_local}@bot.local"
-                if not get_key_by_email(candidate_email):
+                if not rw_repo.get_key_by_email(candidate_email):
                     break
                 attempt += 1
                 candidate_local = f"{base_local}-{attempt}"
@@ -870,7 +1768,7 @@ def get_user_router() -> Router:
                     candidate_email = f"{candidate_local}@bot.local"
                     break
 
-            result = await xui_api.create_or_update_key_on_host(
+            result = await remnawave_api.create_or_update_key_on_host(
                 host_name=host_name,
                 email=candidate_email,
                 days_to_add=int(get_setting("trial_duration_days"))
@@ -881,18 +1779,16 @@ def get_user_router() -> Router:
 
             set_trial_used(user_id)
             
-            new_key_id = add_new_key(
+            new_key_id = rw_repo.record_key_from_payload(
                 user_id=user_id,
+                payload=result,
                 host_name=host_name,
-                xui_client_uuid=result['client_uuid'],
-                key_email=result['email'],
-                expiry_timestamp_ms=result['expiry_timestamp_ms']
             )
             
             await message.delete()
             new_expiry_date = datetime.fromtimestamp(result['expiry_timestamp_ms'] / 1000)
-            final_text = get_purchase_success_text("готов", get_next_key_number(user_id) -1, new_expiry_date, result['connection_string'])
-            await message.answer(text=final_text, reply_markup=keyboards.create_key_info_keyboard(new_key_id))
+            final_text = get_purchase_success_text("new", get_next_key_number(user_id) -1, new_expiry_date, result['connection_string'])
+            await message.answer(text=final_text, reply_markup=keyboards.create_key_info_keyboard(new_key_id, result['connection_string']))
 
         except Exception as e:
             logger.error(f"Error creating trial key for user {user_id} on host {host_name}: {e}", exc_info=True)
@@ -904,14 +1800,14 @@ def get_user_router() -> Router:
         key_id_to_show = int(callback.data.split("_")[2])
         await callback.message.edit_text("Загружаю информацию о ключе...")
         user_id = callback.from_user.id
-        key_data = get_key_by_id(key_id_to_show)
+        key_data = rw_repo.get_key_by_id(key_id_to_show)
 
         if not key_data or key_data['user_id'] != user_id:
             await callback.message.edit_text("❌ Ошибка: ключ не найден.")
             return
             
         try:
-            details = await xui_api.get_key_details_from_host(key_data)
+            details = await remnawave_api.get_key_details_from_host(key_data)
             if not details or not details['connection_string']:
                 await callback.message.edit_text("❌ Ошибка на сервере. Не удалось получить данные ключа.")
                 return
@@ -927,7 +1823,7 @@ def get_user_router() -> Router:
             
             await callback.message.edit_text(
                 text=final_text,
-                reply_markup=keyboards.create_key_info_keyboard(key_id_to_show)
+                reply_markup=keyboards.create_key_info_keyboard(key_id_to_show, connection_string)
             )
         except Exception as e:
             logger.error(f"Error showing key {key_id_to_show}: {e}")
@@ -943,7 +1839,7 @@ def get_user_router() -> Router:
             await callback.answer("Некорректный идентификатор ключа.", show_alert=True)
             return
 
-        key_data = get_key_by_id(key_id)
+        key_data = rw_repo.get_key_by_id(key_id)
         if not key_data or key_data.get('user_id') != callback.from_user.id:
             await callback.answer("Ключ не найден.", show_alert=True)
             return
@@ -980,7 +1876,7 @@ def get_user_router() -> Router:
             return
         new_host_name = parts[1]
 
-        key_data = get_key_by_id(key_id)
+        key_data = rw_repo.get_key_by_id(key_id)
 
         if not key_data or key_data.get('user_id') != callback.from_user.id:
             await callback.answer("Ключ не найден.", show_alert=True)
@@ -994,12 +1890,12 @@ def get_user_router() -> Router:
             await callback.answer("Это уже текущий сервер.", show_alert=True)
             return
 
-        # Точное сохранение срока действия при переносе (без увеличения времени)
+
         try:
             expiry_dt = datetime.fromisoformat(key_data['expiry_date'])
             expiry_timestamp_ms_exact = int(expiry_dt.timestamp() * 1000)
         except Exception:
-            # Fallback: хотя бы 1 день, если дата в БД повреждена
+
             now_dt = datetime.now()
             expiry_timestamp_ms_exact = int((now_dt + timedelta(days=1)).timestamp() * 1000)
 
@@ -1009,8 +1905,8 @@ def get_user_router() -> Router:
 
         email = key_data.get('key_email')
         try:
-            # Передаём точный expiry_timestamp_ms, чтобы не увеличивать срок на панели при переносе
-            result = await xui_api.create_or_update_key_on_host(
+
+            result = await remnawave_api.create_or_update_key_on_host(
                 new_host_name,
                 email,
                 days_to_add=None,
@@ -1022,24 +1918,24 @@ def get_user_router() -> Router:
                 )
                 return
 
-            # Сначала удаляем на старом сервере, пока локально сохранен старый UUID по email
+
             try:
-                await xui_api.delete_client_on_host(old_host, email)
+                await remnawave_api.delete_client_on_host(old_host, email)
             except Exception:
                 pass
 
-            # Затем обновляем локальную БД новым хостом и UUID
+
             update_key_host_and_info(
                 key_id=key_id,
                 new_host_name=new_host_name,
-                new_xui_uuid=result['client_uuid'],
+                new_remnawave_uuid=result['client_uuid'],
                 new_expiry_ms=result['expiry_timestamp_ms']
             )
 
-            # Показываем сразу обновлённые данные ключа
+
             try:
-                updated_key = get_key_by_id(key_id)
-                details = await xui_api.get_key_details_from_host(updated_key)
+                updated_key = rw_repo.get_key_by_id(key_id)
+                details = await remnawave_api.get_key_details_from_host(updated_key)
                 if details and details.get('connection_string'):
                     connection_string = details['connection_string']
                     expiry_date = datetime.fromisoformat(updated_key['expiry_date'])
@@ -1052,7 +1948,7 @@ def get_user_router() -> Router:
                         reply_markup=keyboards.create_key_info_keyboard(key_id)
                     )
                 else:
-                    # Fallback: показать сообщение об успехе
+
                     await callback.message.edit_text(
                         f"✅ Готово! Ключ перенесён на сервер \"{new_host_name}\".\n"
                         "Обновите подписку/конфиг в клиенте, если требуется.",
@@ -1075,11 +1971,11 @@ def get_user_router() -> Router:
     async def show_qr_handler(callback: types.CallbackQuery):
         await callback.answer("Генерирую QR-код...")
         key_id = int(callback.data.split("_")[2])
-        key_data = get_key_by_id(key_id)
+        key_data = rw_repo.get_key_by_id(key_id)
         if not key_data or key_data['user_id'] != callback.from_user.id: return
         
         try:
-            details = await xui_api.get_key_details_from_host(key_data)
+            details = await remnawave_api.get_key_details_from_host(key_data)
             if not details or not details['connection_string']:
                 await callback.answer("Ошибка: Не удалось сгенерировать QR-код.", show_alert=True)
                 return
@@ -1098,8 +1994,9 @@ def get_user_router() -> Router:
         await callback.answer()
         key_id = int(callback.data.split("_")[2])
 
+        intro_text = get_setting("howto_intro_text") or "Выберите вашу платформу для инструкции по подключению VLESS:"
         await callback.message.edit_text(
-            "Выберите вашу платформу для инструкции по подключению VLESS:",
+            intro_text,
             reply_markup=keyboards.create_howto_vless_keyboard_key(key_id),
             disable_web_page_preview=True
         )
@@ -1109,8 +2006,9 @@ def get_user_router() -> Router:
     async def show_instruction_handler(callback: types.CallbackQuery):
         await callback.answer()
 
+        intro_text = get_setting("howto_intro_text") or "Выберите вашу платформу для инструкции по подключению VLESS:"
         await callback.message.edit_text(
-            "Выберите вашу платформу для инструкции по подключению VLESS:",
+            intro_text,
             reply_markup=keyboards.create_howto_vless_keyboard(),
             disable_web_page_preview=True
         )
@@ -1119,7 +2017,7 @@ def get_user_router() -> Router:
     @registration_required
     async def howto_android_handler(callback: types.CallbackQuery):
         await callback.answer()
-        await callback.message.edit_text(
+        text = get_setting("howto_android_text") or (
             "<b>Подключение на Android</b>\n\n"
             "1. <b>Установите приложение V2RayTun:</b> Загрузите и установите приложение V2RayTun из Google Play Store.\n"
             "2. <b>Скопируйте свой ключ (vless://)</b> Перейдите в раздел «Моя подписка» в нашем боте и скопируйте свой ключ.\n"
@@ -1129,16 +2027,45 @@ def get_user_router() -> Router:
             "   • Выберите «Импортировать конфигурацию из буфера обмена» (или аналогичный пункт).\n"
             "4. <b>Выберите сервер:</b> Выберите появившийся сервер в списке.\n"
             "5. <b>Подключитесь к VPN:</b> Нажмите на кнопку подключения (значок «V» или воспроизведения). Возможно, потребуется разрешение на создание VPN-подключения.\n"
-            "6. <b>Проверьте подключение:</b> После подключения проверьте свой IP-адрес, например, на https://whatismyipaddress.com/. Он должен отличаться от вашего реального IP.",
-        reply_markup=keyboards.create_howto_vless_keyboard(),
-        disable_web_page_preview=True
-    )
+            "6. <b>Проверьте подключение:</b> После подключения проверьте свой IP-адрес, например, на https://whatismyipaddress.com/. Он должен отличаться от вашего реального IP."
+        )
+        markup = keyboards.create_howto_vless_keyboard()
+
+        current_text = callback.message.text or ""
+        current_markup = callback.message.reply_markup
+
+        if current_markup and hasattr(current_markup, "model_dump"):
+            current_markup_dump = current_markup.model_dump()
+        else:
+            current_markup_dump = current_markup
+
+        if markup and hasattr(markup, "model_dump"):
+            new_markup_dump = markup.model_dump()
+        else:
+            new_markup_dump = markup
+
+        if current_text == text and current_markup_dump == new_markup_dump:
+            return
+
+        try:
+            await callback.message.edit_text(
+                text,
+                reply_markup=markup,
+                disable_web_page_preview=True
+            )
+        except TelegramBadRequest as exc:
+            error_message = getattr(exc, "message", str(exc))
+            if "message is not modified" not in error_message.lower():
+                raise
+            logger.debug(
+                "Skipping edit_text for howto_android_handler: message is not modified"
+            )
 
     @user_router.callback_query(F.data == "howto_ios")
     @registration_required
     async def howto_ios_handler(callback: types.CallbackQuery):
         await callback.answer()
-        await callback.message.edit_text(
+        text = get_setting("howto_ios_text") or (
             "<b>Подключение на iOS (iPhone/iPad)</b>\n\n"
             "1. <b>Установите приложение V2RayTun:</b> Загрузите и установите приложение V2RayTun из App Store.\n"
             "2. <b>Скопируйте свой ключ (vless://):</b> Перейдите в раздел «Моя подписка» в нашем боте и скопируйте свой ключ.\n"
@@ -1148,16 +2075,19 @@ def get_user_router() -> Router:
             "   • Выберите «Импортировать конфигурацию из буфера обмена» (или аналогичный пункт).\n"
             "4. <b>Выберите сервер:</b> Выберите появившийся сервер в списке.\n"
             "5. <b>Подключитесь к VPN:</b> Включите главный переключатель в V2RayTun. Возможно, потребуется разрешить создание VPN-подключения.\n"
-            "6. <b>Проверьте подключение:</b> После подключения проверьте свой IP-адрес, например, на https://whatismyipaddress.com/. Он должен отличаться от вашего реального IP.",
-        reply_markup=keyboards.create_howto_vless_keyboard(),
-        disable_web_page_preview=True
-    )
+            "6. <b>Проверьте подключение:</b> После подключения проверьте свой IP-адрес, например, на https://whatismyipaddress.com/. Он должен отличаться от вашего реального IP."
+        )
+        await callback.message.edit_text(
+            text,
+            reply_markup=keyboards.create_howto_vless_keyboard(),
+            disable_web_page_preview=True
+        )
 
     @user_router.callback_query(F.data == "howto_windows")
     @registration_required
     async def howto_windows_handler(callback: types.CallbackQuery):
         await callback.answer()
-        await callback.message.edit_text(
+        text = get_setting("howto_windows_text") or (
             "<b>Подключение на Windows</b>\n\n"
             "1. <b>Установите приложение Nekoray:</b> Загрузите Nekoray с https://github.com/MatsuriDayo/Nekoray/releases. Выберите подходящую версию (например, Nekoray-x64.exe).\n"
             "2. <b>Распакуйте архив:</b> Распакуйте скачанный архив в удобное место.\n"
@@ -1171,16 +2101,45 @@ def get_user_router() -> Router:
             "7. Сверху включите пункт 'Режим TUN' ('Tun Mode')\n"
             "8. <b>Выберите сервер:</b> В главном окне выберите появившийся сервер.\n"
             "9. <b>Подключитесь к VPN:</b> Нажмите «Подключить» (Connect).\n"
-            "10. <b>Проверьте подключение:</b> Откройте браузер и проверьте IP на https://whatismyipaddress.com/. Он должен отличаться от вашего реального IP.",
-        reply_markup=keyboards.create_howto_vless_keyboard(),
-        disable_web_page_preview=True
-    )
+            "10. <b>Проверьте подключение:</b> Откройте браузер и проверьте IP на https://whatismyipaddress.com/. Он должен отличаться от вашего реального IP."
+        )
+        markup = keyboards.create_howto_vless_keyboard()
+
+        current_text = callback.message.text or ""
+        current_markup = callback.message.reply_markup
+
+        if current_markup and hasattr(current_markup, "model_dump"):
+            current_markup_dump = current_markup.model_dump()
+        else:
+            current_markup_dump = current_markup
+
+        if markup and hasattr(markup, "model_dump"):
+            new_markup_dump = markup.model_dump()
+        else:
+            new_markup_dump = markup
+
+        if current_text == text and current_markup_dump == new_markup_dump:
+            return
+
+        try:
+            await callback.message.edit_text(
+                text,
+                reply_markup=markup,
+                disable_web_page_preview=True
+            )
+        except TelegramBadRequest as exc:
+            error_message = getattr(exc, "message", str(exc))
+            if "message is not modified" not in error_message.lower():
+                raise
+            logger.debug(
+                "Skipping edit_text for howto_windows_handler: message is not modified"
+            )
 
     @user_router.callback_query(F.data == "howto_linux")
     @registration_required
     async def howto_linux_handler(callback: types.CallbackQuery):
         await callback.answer()
-        await callback.message.edit_text(
+        text = get_setting("howto_linux_text") or (
             "<b>Подключение на Linux</b>\n\n"
             "1. <b>Скачайте и распакуйте Nekoray:</b> Перейдите на https://github.com/MatsuriDayo/Nekoray/releases и скачайте архив для Linux. Распакуйте его в удобную папку.\n"
             "2. <b>Запустите Nekoray:</b> Откройте терминал, перейдите в папку с Nekoray и выполните <code>./nekoray</code> (или используйте графический запуск, если доступен).\n"
@@ -1193,10 +2152,13 @@ def get_user_router() -> Router:
             "6. Сверху включите пункт 'Режим TUN' ('Tun Mode')\n"
             "7. <b>Выберите сервер:</b> В главном окне выберите появившийся сервер.\n"
             "8. <b>Подключитесь к VPN:</b> Нажмите «Подключить» (Connect).\n"
-            "9. <b>Проверьте подключение:</b> Откройте браузер и проверьте IP на https://whatismyipaddress.com/. Он должен отличаться от вашего реального IP.",
-        reply_markup=keyboards.create_howto_vless_keyboard(),
-        disable_web_page_preview=True
-    )
+            "9. <b>Проверьте подключение:</b> Откройте браузер и проверьте IP на https://whatismyipaddress.com/. Он должен отличаться от вашего реального IP."
+        )
+        await callback.message.edit_text(
+            text,
+            reply_markup=keyboards.create_howto_vless_keyboard(),
+            disable_web_page_preview=True
+        )
 
     @user_router.callback_query(F.data == "buy_new_key")
     @registration_required
@@ -1237,7 +2199,7 @@ def get_user_router() -> Router:
             await callback.message.edit_text("❌ Произошла ошибка. Неверный формат ключа.")
             return
 
-        key_data = get_key_by_id(key_id)
+        key_data = rw_repo.get_key_by_id(key_id)
 
         if not key_data or key_data['user_id'] != callback.from_user.id:
             await callback.message.edit_text("❌ Ошибка: Ключ не найден или не принадлежит вам.")
@@ -1292,15 +2254,65 @@ def get_user_router() -> Router:
     async def back_to_plans_handler(callback: types.CallbackQuery, state: FSMContext):
         data = await state.get_data()
         await state.clear()
-        
-        action = data.get('action')
+        action = (data.get('action') or '').strip()
+
 
         if action == 'new':
-            await buy_new_key_handler(callback)
-        elif action == 'extend':
-            await extend_key_handler(callback)
-        else:
-            await back_to_main_menu_handler(callback)
+            host_name = data.get('host_name') or ''
+            if not host_name:
+                await callback.message.edit_text(
+                    "❌ Не удалось определить сервер. Вернитесь в меню.",
+                    reply_markup=keyboards.create_back_to_menu_keyboard()
+                )
+                return
+            plans = get_plans_for_host(host_name)
+            if not plans:
+                await callback.message.edit_text(f"❌ Для сервера \"{host_name}\" не настроены тарифы.")
+                return
+            await callback.message.edit_text(
+                "Выберите тариф для нового ключа:",
+                reply_markup=keyboards.create_plans_keyboard(plans, action="new", host_name=host_name)
+            )
+            return
+
+        if action == 'extend':
+            try:
+                key_id = int(data.get('key_id') or 0)
+            except Exception:
+                key_id = 0
+            if key_id <= 0:
+                await callback.message.edit_text(
+                    "❌ Не удалось определить ключ для продления.",
+                    reply_markup=keyboards.create_back_to_menu_keyboard()
+                )
+                return
+            key_data = rw_repo.get_key_by_id(key_id)
+            if not key_data or key_data.get('user_id') != callback.from_user.id:
+                await callback.message.edit_text("❌ Ошибка: Ключ не найден или не принадлежит вам.")
+                return
+            host_name = key_data.get('host_name')
+            if not host_name:
+                await callback.message.edit_text("❌ Ошибка: У этого ключа не указан сервер. Обратитесь в поддержку.")
+                return
+            plans = get_plans_for_host(host_name)
+            if not plans:
+                await callback.message.edit_text(
+                    f"❌ Извините, для сервера \"{host_name}\" в данный момент не настроены тарифы для продления."
+                )
+                return
+            await callback.message.edit_text(
+                f"Выберите тариф для продления ключа на сервере \"{host_name}\":",
+                reply_markup=keyboards.create_plans_keyboard(
+                    plans=plans,
+                    action="extend",
+                    host_name=host_name,
+                    key_id=key_id
+                )
+            )
+            return
+
+
+        await back_to_main_menu_handler(callback)
 
     @user_router.message(PaymentProcess.waiting_for_email)
     async def process_email_handler(message: types.Message, state: FSMContext):
@@ -1308,7 +2320,7 @@ def get_user_router() -> Router:
             await state.update_data(customer_email=message.text)
             await message.answer(f"✅ Email принят: {message.text}")
 
-            # Показываем опции оплаты с учетом балансов и цены
+
             await show_payment_options(message, state)
             logger.info(f"User {message.chat.id}: State set to waiting_for_payment_method via show_payment_options")
         else:
@@ -1319,7 +2331,7 @@ def get_user_router() -> Router:
         await callback.answer()
         await state.update_data(customer_email=None)
 
-        # Показываем опции оплаты с учетом балансов и цены
+
         await show_payment_options(callback.message, state)
         logger.info(f"User {callback.from_user.id}: State set to waiting_for_payment_method via show_payment_options")
 
@@ -1355,9 +2367,21 @@ def get_user_router() -> Router:
                     f"<b>Новая цена: {final_price:.2f} RUB</b>\n\n"
                 ) + CHOOSE_PAYMENT_METHOD_MESSAGE
 
+        promo_code = data.get('promo_code')
+        promo_discount = Decimal(str(data.get('promo_discount', 0)))
+        if promo_code and promo_discount > 0:
+            final_price = (final_price - promo_discount).quantize(Decimal("0.01"))
+            if final_price < Decimal('0.01'):
+                final_price = Decimal('0.01')
+            message_text = (
+                f"🎟 Промокод {promo_code} применён!\n"
+                f"Старая цена: <s>{price:.2f} RUB</s>\n"
+                f"<b>Новая цена: {final_price:.2f} RUB</b>\n\n"
+            ) + CHOOSE_PAYMENT_METHOD_MESSAGE
+
         await state.update_data(final_price=float(final_price))
 
-        # Получаем основной баланс для показа кнопки оплаты с баланса
+
         try:
             main_balance = get_balance(message.chat.id)
         except Exception:
@@ -1374,7 +2398,8 @@ def get_user_router() -> Router:
                     key_id=data.get('key_id'),
                     show_balance=show_balance_btn,
                     main_balance=main_balance,
-                    price=float(final_price)
+                    price=float(final_price),
+                    promo_applied=bool(data.get('promo_code')),
                 )
             )
         except TelegramBadRequest:
@@ -1400,9 +2425,71 @@ def get_user_router() -> Router:
         )
         await state.set_state(PaymentProcess.waiting_for_email)
 
+    @user_router.callback_query(PaymentProcess.waiting_for_payment_method, F.data == "enter_promo_code")
+    async def prompt_promo_code(callback: types.CallbackQuery, state: FSMContext):
+        await callback.answer()
+        await callback.message.edit_text(
+            "🎟 Введите промокод. Напишите 'отмена', чтобы вернуться без изменений:",
+            reply_markup=keyboards.create_cancel_keyboard("cancel_promo")
+        )
+        await state.set_state(PaymentProcess.waiting_for_promo_code)
+
+    @user_router.callback_query(PaymentProcess.waiting_for_promo_code, F.data == "cancel_promo")
+    async def cancel_promo_entry(callback: types.CallbackQuery, state: FSMContext):
+        await callback.answer("Отменено")
+        await show_payment_options(callback.message, state)
+
+    @user_router.message(PaymentProcess.waiting_for_promo_code)
+    async def handle_promo_code_input(message: types.Message, state: FSMContext):
+        code_raw = (message.text or '').strip()
+        if not code_raw:
+            await message.answer("❌ Промокод не должен быть пустым. Попробуйте снова или напишите 'отмена'.")
+            return
+        if code_raw.lower() in {"отмена", "cancel", "назад", "stop", "стоп"}:
+            await show_payment_options(message, state)
+            return
+        promo, error = check_promo_code_available(code_raw, message.from_user.id)
+        if error:
+            errors = {
+                "not_found": "❌ Промокод не найден.",
+                "inactive": "❌ Промокод отключён.",
+                "not_started": "❌ Промокод ещё не начал действовать.",
+                "expired": "❌ Срок действия промокода истёк.",
+                "total_limit_reached": "❌ Лимит активаций исчерпан.",
+                "user_limit_reached": "❌ Вы уже использовали этот промокод максимально возможное количество раз.",
+                "empty_code": "❌ Промокод не должен быть пустым.",
+            }
+            await message.answer(errors.get(error, "❌ Не удалось применить промокод."))
+            return
+        discount_amount = Decimal(str(promo.get('discount_amount') or 0))
+        percent = Decimal(str(promo.get('discount_percent') or 0))
+        if percent > 0:
+            data = await state.get_data()
+            plan = get_plan_by_id(data.get('plan_id'))
+            plan_price = Decimal(str(plan['price'])) if plan else Decimal('0')
+            discount_amount = (plan_price * percent / 100).quantize(Decimal("0.01"))
+        if discount_amount <= 0:
+            await message.answer("❌ Промокод не даёт скидку. Обратитесь в поддержку.")
+            return
+        await state.update_data(promo_code=promo['code'], promo_discount=float(discount_amount))
+        await message.answer(f"✅ Промокод {promo['code']} применён! Скидка: {float(discount_amount):.2f} RUB.")
+        await show_payment_options(message, state)
+
     @user_router.callback_query(PaymentProcess.waiting_for_payment_method, F.data == "pay_yookassa")
     async def create_yookassa_payment_handler(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("Создаю ссылку на оплату...")
+        
+        # Ensure YooKassa configuration is set
+        yookassa_shop_id = get_setting("yookassa_shop_id")
+        yookassa_secret_key = get_setting("yookassa_secret_key")
+        
+        if not yookassa_shop_id or not yookassa_secret_key:
+            await callback.message.answer("❌ YooKassa не настроен. Обратитесь к администратору.")
+            await state.clear()
+            return
+            
+        Configuration.account_id = yookassa_shop_id
+        Configuration.secret_key = yookassa_secret_key
         
         data = await state.get_data()
         user_data = get_user(callback.from_user.id)
@@ -1423,7 +2510,15 @@ def get_user_router() -> Router:
             discount_percentage = Decimal(discount_percentage_str)
             if discount_percentage > 0:
                 discount_amount = (base_price * discount_percentage / 100).quantize(Decimal("0.01"))
-                price_rub = base_price - discount_amount
+                base_price -= discount_amount
+        promo_code = data.get('promo_code')
+        promo_discount = Decimal(str(data.get('promo_discount', 0)))
+        if promo_code and promo_discount > 0:
+            discount_amount = promo_discount
+            base_price = (base_price - discount_amount).quantize(Decimal("0.01"))
+            if base_price < Decimal('0.01'):
+                base_price = Decimal('0.01')
+        price_rub = base_price
 
         plan_id = data.get('plan_id')
         customer_email = data.get('customer_email')
@@ -1455,7 +2550,9 @@ def get_user_router() -> Router:
                         "description": f"Подписка на {months} мес.",
                         "quantity": "1.00",
                         "amount": {"value": price_str_for_api, "currency": "RUB"},
-                        "vat_code": "1"
+                        "vat_code": "1",
+                        "payment_subject": "service",
+                        "payment_mode": "full_payment"
                     }]
                 }
             payment_payload = {
@@ -1467,7 +2564,9 @@ def get_user_router() -> Router:
                     "user_id": user_id, "months": months, "price": price_float_for_metadata, 
                     "action": action, "key_id": key_id, "host_name": host_name,
                     "plan_id": plan_id, "customer_email": customer_email,
-                    "payment_method": "YooKassa"
+                    "payment_method": "YooKassa",
+                    "promo_code": promo_code,
+                    "promo_discount": float(data.get('promo_discount', 0)),
                 }
             }
             if receipt:
@@ -1530,27 +2629,123 @@ def get_user_router() -> Router:
             discount_percentage = Decimal(discount_percentage_str)
             if discount_percentage > 0:
                 discount_amount = (base_price * discount_percentage / 100).quantize(Decimal("0.01"))
-                price_rub_decimal = base_price - discount_amount
+                base_price -= discount_amount
+        promo_code = data.get('promo_code')
+        promo_discount = Decimal(str(data.get('promo_discount', 0)))
+        if promo_code and promo_discount > 0:
+            discount_amount = promo_discount
+            base_price = (base_price - discount_amount).quantize(Decimal("0.01"))
+            if base_price < Decimal('0.01'):
+                base_price = Decimal('0.01')
+        price_rub_decimal = base_price
         months = plan['months']
         
         final_price_float = float(price_rub_decimal)
 
-        pay_url = await _create_heleket_payment_request(
+        result = await _create_cryptobot_invoice(
             user_id=callback.from_user.id,
-            price=final_price_float,
+            price_rub=final_price_float,
             months=plan['months'],
             host_name=data.get('host_name'),
             state_data=data
         )
         
-        if pay_url:
+        if result:
+            pay_url, invoice_id = result
             await callback.message.edit_text(
                 "Нажмите на кнопку ниже для оплаты:",
-                reply_markup=keyboards.create_payment_keyboard(pay_url)
+                reply_markup=keyboards.create_cryptobot_payment_keyboard(pay_url, invoice_id)
             )
             await state.clear()
         else:
-            await callback.message.edit_text("❌ Не удалось создать счет Heleket. Попробуйте другой способ оплаты.")
+            await callback.message.edit_text("❌ Не удалось создать счёт в CryptoBot. Попробуйте другой способ оплаты.")
+
+    @user_router.callback_query(F.data.startswith("check_crypto_invoice:"))
+    async def check_crypto_invoice_handler(callback: types.CallbackQuery, state: FSMContext, bot: Bot):
+        await callback.answer("Проверяю статус оплаты...")
+        try:
+            parts = (callback.data or "").split(":", 1)
+            invoice_id_str = parts[1] if len(parts) > 1 else ""
+            invoice_id = int(invoice_id_str)
+        except Exception:
+            await callback.message.answer("❌ Некорректный идентификатор инвойса.")
+            return
+
+        token = (get_setting("cryptobot_token") or "").strip()
+        if not token:
+            await callback.message.answer("❌ CryptoBot токен не задан.")
+            return
+
+        url = "https://pay.crypt.bot/api/getInvoices"
+        headers = {
+            "Crypto-Pay-API-Token": token,
+            "Content-Type": "application/json",
+        }
+        body = {"invoice_ids": [invoice_id]}
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, json=body, timeout=20) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        logger.error(f"CryptoBot getInvoices HTTP {resp.status}: {text}")
+                        await callback.message.answer("⏳ Оплата ещё не поступила. Попробуйте позже.")
+                        return
+                    data = await resp.json(content_type=None)
+        except Exception as e:
+            logger.error(f"CryptoBot getInvoices failed: {e}", exc_info=True)
+            await callback.message.answer("⏳ Не удалось проверить статус. Попробуйте позже.")
+            return
+
+
+        invoices = []
+        if isinstance(data, dict) and data.get("ok"):
+            res = data.get("result")
+            if isinstance(res, dict) and isinstance(res.get("items"), list):
+                invoices = res.get("items")
+            elif isinstance(res, list):
+                invoices = res
+
+        if not invoices:
+            await callback.message.answer("⏳ Оплата ещё не поступила. Попробуйте позже.")
+            return
+
+        inv = invoices[0]
+        status = (inv.get("status") or inv.get("invoice_status") or "").lower()
+        if status != "paid":
+            await callback.message.answer("⏳ Оплата ещё не поступила. Попробуйте позже.")
+            return
+
+        payload_string = inv.get("payload")
+        if not payload_string:
+            await callback.message.answer("⚠️ Оплата получена, но отсутствует payload. Обратитесь в поддержку.")
+            return
+
+
+        p = payload_string.split(":")
+        if len(p) < 9:
+            await callback.message.answer("⚠️ Оплата получена, но формат данных некорректен. Обратитесь в поддержку.")
+            return
+
+        metadata = {
+            "user_id": p[0],
+            "months": p[1],
+            "price": p[2],
+            "action": p[3],
+            "key_id": p[4],
+            "host_name": p[5],
+            "plan_id": p[6],
+            "customer_email": (p[7] if p[7] != 'None' else None),
+            "payment_method": p[8],
+            "transaction_id": str(invoice_id),
+        }
+
+        try:
+            await process_successful_payment(bot, metadata)
+            await callback.message.answer("✅ Оплата получена! Профиль/баланс скоро обновится.")
+        except Exception as e:
+            logger.error(f"CryptoBot manual check: process_successful_payment failed: {e}", exc_info=True)
+            await callback.message.answer("⚠️ Оплата получена, но обработка не завершена. Обратитесь в поддержку.")
 
     @user_router.callback_query(PaymentProcess.waiting_for_payment_method, F.data == "pay_tonconnect")
     async def create_ton_invoice_handler(callback: types.CallbackQuery, state: FSMContext):
@@ -1635,10 +2830,13 @@ def get_user_router() -> Router:
         months = int(plan['months'])
         price = float(data.get('final_price', plan['price']))
 
-        # Пытаемся списать средства с основного баланса
+
         if not deduct_from_balance(user_id, price):
             await callback.answer("Недостаточно средств на основном балансе.", show_alert=True)
             return
+
+        promo_code = (data.get('promo_code') or '').strip() if isinstance(data, dict) else ''
+        promo_discount = float(data.get('promo_discount') or 0) if promo_code else 0.0
 
         metadata = {
             "user_id": user_id,
@@ -1651,7 +2849,9 @@ def get_user_router() -> Router:
             "customer_email": data.get('customer_email'),
             "payment_method": "Balance",
             "chat_id": callback.message.chat.id,
-            "message_id": callback.message.message_id
+            "message_id": callback.message.message_id,
+            "promo_code": promo_code,
+            "promo_discount": promo_discount,
         }
 
         await state.clear()
@@ -1673,7 +2873,7 @@ async def notify_admin_of_purchase(bot: Bot, metadata: dict):
         price = metadata.get('price')
         action = metadata.get('action')
         payment_method = metadata.get('payment_method') or 'Unknown'
-        # Локализация методов оплаты для уведомления админу
+
         payment_method_map = {
             'Balance': 'Баланс',
             'Card': 'Карта',
@@ -1695,20 +2895,89 @@ async def notify_admin_of_purchase(bot: Bot, metadata: dict):
             f"💰 Сумма: {float(price):.2f} RUB\n"
             f"⚙️ Действие: {'Новый ключ' if action == 'new' else 'Продление'}"
         )
+
+        promo_code = (metadata.get('promo_code') or '').strip() if isinstance(metadata, dict) else ''
+        if promo_code:
+            try:
+                applied_amount = float(metadata.get('promo_applied_amount') or metadata.get('promo_discount') or 0)
+            except Exception:
+                applied_amount = 0.0
+            text += f"\n🎟 Промокод: {promo_code} (-{applied_amount:.2f} RUB)"
+
+            def _to_int(val):
+                try:
+                    if val in (None, '', 'None'):
+                        return None
+                    return int(val)
+                except Exception:
+                    return None
+
+            total_limit = _to_int(metadata.get('promo_usage_total_limit'))
+            total_used = _to_int(metadata.get('promo_usage_total_used'))
+            per_user_limit = _to_int(metadata.get('promo_usage_per_user_limit'))
+            per_user_used = _to_int(metadata.get('promo_usage_per_user_used'))
+
+            extra_lines = []
+            if total_limit:
+                extra_lines.append(f"Общий лимит: {total_used or 0}/{total_limit}")
+            elif total_used is not None:
+                extra_lines.append(f"Общий использований: {total_used}")
+
+            if per_user_limit:
+                extra_lines.append(f"Лимит на пользователя: {per_user_used or 0}/{per_user_limit}")
+
+            status_parts = []
+            if metadata.get('promo_disabled'):
+                reason = (metadata.get('promo_disabled_reason') or '').strip()
+                reason_map = {
+                    'total_limit': 'исчерпан общий лимит',
+                    'expired': 'истёк срок действия'
+                }
+                status_parts.append(f"Промокод отключён ({reason_map.get(reason, reason or 'причина неизвестна')})")
+            else:
+                if metadata.get('promo_user_limit_reached'):
+                    status_parts.append('Достигнут лимит на пользователя')
+                if metadata.get('promo_expired'):
+                    status_parts.append('Срок действия истёк')
+                availability_err = metadata.get('promo_availability_error')
+                if availability_err:
+                    status_parts.append(f"Статус доступности: {availability_err}")
+
+            if metadata.get('promo_disable_failed'):
+                status_parts.append('Не удалось отключить код (проверьте вручную)')
+            if metadata.get('promo_redeem_failed'):
+                status_parts.append('Redeem не выполнен — проверьте вручную')
+
+            if extra_lines:
+                text += "\n📊 " + " | ".join(extra_lines)
+            if status_parts:
+                text += "\n⚠️ " + " | ".join(status_parts)
+
         await bot.send_message(admin_id, text)
     except Exception as e:
         logger.warning(f"notify_admin_of_purchase failed: {e}")
 
 async def process_successful_payment(bot: Bot, metadata: dict):
+    logger.info("💳 Обрабатываем успешный платеж")
     try:
         action = metadata.get('action')
         user_id = int(metadata.get('user_id'))
         price = float(metadata.get('price'))
-        # Поля ниже нужны только для покупок ключей/продлений
-        months = int(metadata.get('months', 0))
-        key_id = int(metadata.get('key_id', 0)) if metadata.get('key_id') is not None else 0
+        logger.info(f"📊 Детали платежа: действие={action}, пользователь={user_id}, сумма={price:.2f} RUB")
+        
+
+        def _to_int(val, default=0):
+            try:
+                if val in (None, '', 'None', 'null'):
+                    return default
+                return int(val)
+            except (ValueError, TypeError):
+                return default
+
+        months = _to_int(metadata.get('months'), 0)
+        key_id = _to_int(metadata.get('key_id'), 0)
         host_name = metadata.get('host_name', '')
-        plan_id = int(metadata.get('plan_id', 0)) if metadata.get('plan_id') is not None else 0
+        plan_id = _to_int(metadata.get('plan_id'), 0)
         customer_email = metadata.get('customer_email')
         payment_method = metadata.get('payment_method')
 
@@ -1725,17 +2994,27 @@ async def process_successful_payment(bot: Bot, metadata: dict):
         except TelegramBadRequest as e:
             logger.warning(f"Could not delete payment message: {e}")
 
-    # Спец-ветка: пополнение баланса
+
     if action == "top_up":
+        logger.info(f"💰 Обрабатываем пополнение баланса для пользователя {user_id}: {float(price):.2f} RUB")
+        ok = False
         try:
             ok = add_to_balance(user_id, float(price))
+            if ok:
+                logger.info(f"✅ Баланс успешно обновлен для пользователя {user_id}: +{float(price):.2f} RUB")
+            else:
+                logger.error(f"❌ Не удалось обновить баланс для пользователя {user_id}")
         except Exception as e:
-            logger.error(f"Failed to add to balance for user {user_id}: {e}", exc_info=True)
+            logger.error(f"💥 Ошибка при пополнении баланса для пользователя {user_id}: {e}", exc_info=True)
             ok = False
-        # Лог транзакции
+        
+
         try:
-            user_info = get_user(user_id)
-            log_username = user_info.get('username', 'N/A') if user_info else 'N/A'
+
+            log_username = (metadata.get('tg_username') or '').strip() if isinstance(metadata, dict) else ''
+            if not log_username:
+                user_info = get_user(user_id)
+                log_username = (user_info.get('username') if user_info else '') or f"@{user_id}"
             log_transaction(
                 username=log_username,
                 transaction_id=None,
@@ -1750,6 +3029,70 @@ async def process_successful_payment(bot: Bot, metadata: dict):
             )
         except Exception:
             pass
+
+
+        try:
+            pm_for_ref = (payment_method or '').strip().lower()
+            if pm_for_ref == 'balance':
+                logger.info(f"Referral(top_up): skip accrual for user {user_id} because top-up was made from internal balance.")
+            else:
+                user_data = get_user(user_id) or {}
+                referrer_id = user_data.get('referred_by')
+                if referrer_id:
+                    try:
+                        referrer_id = int(referrer_id)
+                    except Exception:
+                        logger.warning(f"Referral(top_up): invalid referrer_id={referrer_id} for user {user_id}")
+                        referrer_id = None
+                if referrer_id:
+                    try:
+                        reward_type = (get_setting("referral_reward_type") or "percent_purchase").strip()
+                    except Exception:
+                        reward_type = "percent_purchase"
+                    reward = Decimal("0")
+                    if reward_type == "fixed_start_referrer":
+                        reward = Decimal("0")
+                    elif reward_type == "fixed_purchase":
+                        try:
+                            amount_raw = get_setting("fixed_referral_bonus_amount") or "50"
+                            reward = Decimal(str(amount_raw)).quantize(Decimal("0.01"))
+                        except Exception:
+                            reward = Decimal("50.00")
+                    else:
+
+                        try:
+                            percentage = Decimal(get_setting("referral_percentage") or "0")
+                        except Exception:
+                            percentage = Decimal("0")
+                        reward = (Decimal(str(price)) * percentage / 100).quantize(Decimal("0.01"))
+                    logger.info(f"Referral(top_up): user={user_id}, referrer={referrer_id}, type={reward_type}, reward={float(reward):.2f}")
+                    if float(reward) > 0:
+                        try:
+                            ok_ref = add_to_balance(referrer_id, float(reward))
+                        except Exception as e:
+                            logger.warning(f"Referral(top_up): add_to_balance failed for referrer {referrer_id}: {e}")
+                            ok_ref = False
+                        try:
+                            add_to_referral_balance_all(referrer_id, float(reward))
+                        except Exception as e:
+                            logger.warning(f"Referral(top_up): failed to increment referral_balance_all for {referrer_id}: {e}")
+                        referrer_username = user_data.get('username', 'пользователь')
+                        if ok_ref:
+                            try:
+                                await bot.send_message(
+                                    chat_id=referrer_id,
+                                    text=(
+                                        "💰 Вам начислено реферальное вознаграждение за пополнение баланса!\n"
+                                        f"Пользователь: {referrer_username} (ID: {user_id})\n"
+                                        f"Сумма: {float(reward):.2f} RUB"
+                                    )
+                                )
+                            except Exception as e:
+                                logger.warning(f"Referral(top_up): could not send reward notification to {referrer_id}: {e}")
+        except Exception as e:
+            logger.warning(f"Referral(top_up): unexpected error while processing reward for user {user_id}: {e}")
+
+
         try:
             current_balance = 0.0
             try:
@@ -1775,9 +3118,10 @@ async def process_successful_payment(bot: Bot, metadata: dict):
                     ),
                     reply_markup=keyboards.create_support_keyboard()
                 )
-        except Exception:
-            pass
-        # Админ-уведомление о пополнении (по возможности)
+        except Exception as e:
+            logger.error(f"Failed to send top-up notification to user {user_id}: {e}")
+        
+
         try:
             admins = [u for u in (get_all_users() or []) if is_admin(u.get('telegram_id') or 0)]
             for a in admins:
@@ -1794,12 +3138,12 @@ async def process_successful_payment(bot: Bot, metadata: dict):
     )
     try:
         email = ""
-        # Цена нужна ниже вне зависимости от ветки
+
         price = float(metadata.get('price'))
         result = None
-        # Определяем email для операции и вызываем панель для обеих веток (new/extend)
+
         if action == "new":
-            # Сформируем email в формате {username}@bot.local с авто-суффиксом при коллизиях
+
             user_data = get_user(user_id) or {}
             raw_username = (user_data.get('username') or f'user{user_id}').lower()
             username_slug = re.sub(r"[^a-z0-9._-]", "_", raw_username).strip("_")[:16] or f"user{user_id}"
@@ -1808,7 +3152,7 @@ async def process_successful_payment(bot: Bot, metadata: dict):
             attempt = 1
             while True:
                 candidate_email = f"{candidate_local}@bot.local"
-                if not get_key_by_email(candidate_email):
+                if not rw_repo.get_key_by_email(candidate_email):
                     break
                 attempt += 1
                 candidate_local = f"{base_local}-{attempt}"
@@ -1817,91 +3161,107 @@ async def process_successful_payment(bot: Bot, metadata: dict):
                     candidate_email = f"{candidate_local}@bot.local"
                     break
         else:
-            # Продление существующего ключа — достаём email по key_id
-            existing_key = get_key_by_id(key_id)
+
+            existing_key = rw_repo.get_key_by_id(key_id)
             if not existing_key or not existing_key.get('key_email'):
                 await processing_message.edit_text("❌ Не удалось найти ключ для продления.")
                 return
             candidate_email = existing_key['key_email']
 
-        result = await xui_api.create_or_update_key_on_host(
+        result = await remnawave_api.create_or_update_key_on_host(
             host_name=host_name,
             email=candidate_email,
             days_to_add=int(months * 30)
         )
         if not result:
-            await processing_message.edit_text("❌ Не удалось создать/обновить ключ в панели.")
+            await processing_message.edit_text("❌ Не удалось создать/обновить ключ на панели Remnawave.")
             return
 
         if action == "new":
-            key_id = add_new_key(
+            key_id = rw_repo.record_key_from_payload(
                 user_id=user_id,
+                payload=result,
                 host_name=host_name,
-                xui_client_uuid=result['client_uuid'],
-                key_email=result['email'],
-                expiry_timestamp_ms=result['expiry_timestamp_ms']
             )
+            if not key_id:
+                await processing_message.edit_text("❌ Не удалось сохранить ключ. Попробуйте позже.")
+                return
         elif action == "extend":
-            update_key_info(key_id, result['client_uuid'], result['expiry_timestamp_ms'])
+            if not rw_repo.update_key(
+                key_id,
+                remnawave_user_uuid=result['client_uuid'],
+                expire_at_ms=result['expiry_timestamp_ms'],
+            ):
+                await processing_message.edit_text("❌ Не удалось обновить информацию о ключе. Попробуйте позже.")
+                return
 
-            user_data = get_user(user_id)
-            referrer_id = user_data.get('referred_by')
 
-            # Начисляем реферальное вознаграждение по покупке — зависит от типа системы
-            if referrer_id:
-                try:
-                    referrer_id = int(referrer_id)
-                except Exception:
-                    logger.warning(f"Referral: invalid referrer_id={referrer_id} for user {user_id}")
-                    referrer_id = None
-            if referrer_id:
-                # Выбор логики по типу: процент, фикс за покупку; для fixed_start_referrer — вознаграждение по покупке не начисляем
-                try:
-                    reward_type = (get_setting("referral_reward_type") or "percent_purchase").strip()
-                except Exception:
-                    reward_type = "percent_purchase"
-                reward = Decimal("0")
-                if reward_type == "fixed_start_referrer":
+        try:
+            pm_for_ref = (payment_method or '').strip().lower()
+            if pm_for_ref == 'balance':
+                logger.info(f"Referral: skip accrual for user {user_id} because payment was made from internal balance.")
+            else:
+                user_data = get_user(user_id) or {}
+                referrer_id = user_data.get('referred_by')
+                if referrer_id:
+                    try:
+                        referrer_id = int(referrer_id)
+                    except Exception:
+                        logger.warning(f"Referral: invalid referrer_id={referrer_id} for user {user_id}")
+                        referrer_id = None
+                if referrer_id:
+
+                    try:
+                        reward_type = (get_setting("referral_reward_type") or "percent_purchase").strip()
+                    except Exception:
+                        reward_type = "percent_purchase"
                     reward = Decimal("0")
-                elif reward_type == "fixed_purchase":
-                    try:
-                        amount_raw = get_setting("fixed_referral_bonus_amount") or "50"
-                        reward = Decimal(str(amount_raw)).quantize(Decimal("0.01"))
-                    except Exception:
-                        reward = Decimal("50.00")
-                else:
-                    # percent_purchase (по умолчанию)
-                    try:
-                        percentage = Decimal(get_setting("referral_percentage") or "0")
-                    except Exception:
-                        percentage = Decimal("0")
-                    reward = (Decimal(str(price)) * percentage / 100).quantize(Decimal("0.01"))
-                logger.info(f"Referral: user={user_id}, referrer={referrer_id}, type={reward_type}, reward={float(reward):.2f}")
-                if float(reward) > 0:
-                    try:
-                        ok = add_to_balance(referrer_id, float(reward))
-                    except Exception as e:
-                        logger.warning(f"Referral: add_to_balance failed for referrer {referrer_id}: {e}")
-                        ok = False
-                    try:
-                        add_to_referral_balance_all(referrer_id, float(reward))
-                    except Exception as e:
-                        logger.warning(f"Failed to increment referral_balance_all for {referrer_id}: {e}")
-                    referrer_username = user_data.get('username', 'пользователь')
-                    if ok:
+                    if reward_type == "fixed_start_referrer":
+                        reward = Decimal("0")
+                    elif reward_type == "fixed_purchase":
                         try:
-                            await bot.send_message(
-                                chat_id=referrer_id,
-                                text=(
-                                    "💰 Вам начислено реферальное вознаграждение!\n"
-                                    f"Пользователь: {referrer_username} (ID: {user_id})\n"
-                                    f"Сумма: {float(reward):.2f} RUB"
-                                )
-                            )
-                        except Exception as e:
-                            logger.warning(f"Could not send referral reward notification to {referrer_id}: {e}")
+                            amount_raw = get_setting("fixed_referral_bonus_amount") or "50"
+                            reward = Decimal(str(amount_raw)).quantize(Decimal("0.01"))
+                        except Exception:
+                            reward = Decimal("50.00")
+                    else:
 
-        update_user_stats(user_id, price, months)
+                        try:
+                            percentage = Decimal(get_setting("referral_percentage") or "0")
+                        except Exception:
+                            percentage = Decimal("0")
+                        reward = (Decimal(str(price)) * percentage / 100).quantize(Decimal("0.01"))
+                    logger.info(f"Referral: user={user_id}, referrer={referrer_id}, type={reward_type}, reward={float(reward):.2f}")
+                    if float(reward) > 0:
+                        try:
+                            ok = add_to_balance(referrer_id, float(reward))
+                        except Exception as e:
+                            logger.warning(f"Referral: add_to_balance failed for referrer {referrer_id}: {e}")
+                            ok = False
+                        try:
+                            add_to_referral_balance_all(referrer_id, float(reward))
+                        except Exception as e:
+                            logger.warning(f"Failed to increment referral_balance_all for {referrer_id}: {e}")
+                        referrer_username = user_data.get('username', 'пользователь')
+                        if ok:
+                            try:
+                                await bot.send_message(
+                                    chat_id=referrer_id,
+                                    text=(
+                                        "💰 Вам начислено реферальное вознаграждение!\n"
+                                        f"Пользователь: {referrer_username} (ID: {user_id})\n"
+                                        f"Сумма: {float(reward):.2f} RUB"
+                                    )
+                                )
+                            except Exception as e:
+                                logger.warning(f"Could not send referral reward notification to {referrer_id}: {e}")
+        except Exception as e:
+            logger.warning(f"Referral: unexpected error while processing reward for user {user_id}: {e}")
+
+
+        pm = (payment_method or '').strip().lower()
+        spent_for_stats = 0.0 if pm == 'balance' else price
+        update_user_stats(user_id, spent_for_stats, months)
         
         user_info = get_user(user_id)
 
@@ -1917,7 +3277,7 @@ async def process_successful_payment(bot: Bot, metadata: dict):
             "customer_email": metadata.get('customer_email')
         })
 
-        # Определяем payment_id для лога: берём из metadata, если есть (например, при отложенных транзакциях), иначе генерируем новый UUID
+
         payment_id_for_log = metadata.get('payment_id') or str(uuid.uuid4())
 
         log_transaction(
@@ -1932,6 +3292,78 @@ async def process_successful_payment(bot: Bot, metadata: dict):
             payment_method=log_method,
             metadata=log_metadata
         )
+        
+        try:
+            promo_code_val = (metadata.get('promo_code') or '').strip()
+        except Exception:
+            promo_code_val = ''
+        if promo_code_val:
+            try:
+                applied_amount = float(metadata.get('promo_discount') or 0)
+            except Exception:
+                applied_amount = 0.0
+            promo_info = None
+            availability_error = None
+            try:
+                promo_info = redeem_promo_code(
+                    promo_code_val,
+                    user_id,
+                    applied_amount=applied_amount,
+                    order_id=payment_id_for_log
+                )
+            except Exception as e:
+                logger.warning(f"Promo: redeem failed for code {promo_code_val}: {e}")
+            should_disable = False
+            disable_reason = None
+            if promo_info:
+                try:
+                    limit_user = promo_info.get('usage_limit_per_user') or 0
+                    user_used = promo_info.get('user_used_count') or 0
+                    metadata['promo_usage_per_user_limit'] = limit_user
+                    metadata['promo_usage_per_user_used'] = user_used
+                    if limit_user and user_used >= limit_user:
+                        metadata['promo_user_limit_reached'] = True
+                except Exception:
+                    pass
+                try:
+                    limit_total = promo_info.get('usage_limit_total') or 0
+                    used_total = promo_info.get('used_total') or 0
+                    metadata['promo_usage_total_limit'] = limit_total
+                    metadata['promo_usage_total_used'] = used_total
+                    if limit_total and used_total >= limit_total:
+                        should_disable = True
+                        disable_reason = 'total_limit'
+                except Exception:
+                    pass
+            else:
+                metadata['promo_redeem_failed'] = True
+                try:
+                    _, availability_error = check_promo_code_available(promo_code_val, user_id)
+                except Exception as e:
+                    logger.warning(f"Promo: availability check failed for code {promo_code_val}: {e}")
+                    availability_error = None
+                if availability_error:
+                    metadata['promo_availability_error'] = availability_error
+                if availability_error == 'user_limit_reached':
+                    metadata['promo_user_limit_reached'] = True
+                if availability_error == 'total_limit_reached':
+                    should_disable = True
+                    disable_reason = 'total_limit'
+                if availability_error == 'expired':
+                    should_disable = True
+                    disable_reason = 'expired'
+                    metadata['promo_expired'] = True
+            if should_disable:
+                try:
+                    if update_promo_code_status(promo_code_val, is_active=False):
+                        metadata['promo_disabled'] = True
+                        metadata['promo_disabled_reason'] = disable_reason
+                    else:
+                        metadata['promo_disable_failed'] = True
+                except Exception as e:
+                    logger.warning(f"Promo: failed to deactivate code {promo_code_val}: {e}")
+                    metadata['promo_disable_failed'] = True
+            metadata['promo_applied_amount'] = applied_amount
         
         await processing_message.delete()
         
@@ -1948,7 +3380,7 @@ async def process_successful_payment(bot: Bot, metadata: dict):
         key_number = next((i + 1 for i, key in enumerate(all_user_keys) if key['key_id'] == key_id), len(all_user_keys))
 
         final_text = get_purchase_success_text(
-            action="создан" if action == "new" else "продлен",
+            action="extend" if action == "extend" else "new",
             key_number=key_number,
             expiry_date=new_expiry_date or datetime.now(),
             connection_string=connection_string or ""
@@ -1974,3 +3406,5 @@ async def process_successful_payment(bot: Bot, metadata: dict):
                 await bot.send_message(chat_id=user_id, text="❌ Ошибка при выдаче ключа.")
             except Exception:
                 pass
+
+

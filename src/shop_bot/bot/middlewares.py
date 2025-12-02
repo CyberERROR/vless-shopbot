@@ -2,7 +2,7 @@ from typing import Callable, Dict, Any, Awaitable
 from aiogram import BaseMiddleware
 from aiogram.types import TelegramObject, Message, CallbackQuery, Chat
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from shop_bot.data_manager.database import get_user, get_setting
+from shop_bot.data_manager.remnawave_repository import get_user, get_setting
 
 class BanMiddleware(BaseMiddleware):
     async def __call__(
@@ -18,7 +18,7 @@ class BanMiddleware(BaseMiddleware):
         user_data = get_user(user.id)
         if user_data and user_data.get('is_banned'):
             ban_message_text = "🚫 Вы заблокированы и не можете использовать этого бота."
-            # Соберём клавиатуру поддержки без кнопки "Назад в меню"
+
             try:
                 support = (get_setting("support_bot_username") or get_setting("support_user") or "").strip()
             except Exception:
@@ -26,7 +26,7 @@ class BanMiddleware(BaseMiddleware):
             kb_builder = InlineKeyboardBuilder()
             url: str | None = None
             if support:
-                if support.startswith("@"):  # @username
+                if support.startswith("@"):
                     url = f"tg://resolve?domain={support[1:]}"
                 elif support.startswith("tg://"):
                     url = support
@@ -46,7 +46,7 @@ class BanMiddleware(BaseMiddleware):
             ban_kb = kb_builder.as_markup()
 
             if isinstance(event, CallbackQuery):
-                # Показать алерт и дополнительно отправить сообщение с кнопкой поддержки
+
                 await event.answer(ban_message_text, show_alert=True)
                 try:
                     await event.bot.send_message(
@@ -60,7 +60,7 @@ class BanMiddleware(BaseMiddleware):
                 try:
                     await event.answer(ban_message_text, reply_markup=ban_kb)
                 except Exception:
-                    # Фолбэк без клавиатуры
+
                     await event.answer(ban_message_text)
             return
         

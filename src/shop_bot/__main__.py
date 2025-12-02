@@ -4,15 +4,15 @@ import asyncio
 import signal
 import re
 try:
-    # Helps show ANSI colors on Windows terminals and some TTY-less streams
-    import colorama  # type: ignore
+
+    import colorama
     colorama_available = True
 except Exception:
     colorama_available = False
 
 from shop_bot.webhook_server.app import create_webhook_app
 from shop_bot.data_manager.scheduler import periodic_subscription_check
-from shop_bot.data_manager import database
+from shop_bot.data_manager import remnawave_repository as rw_repo
 from shop_bot.bot_controller import BotController
 
 def main():
@@ -21,14 +21,14 @@ def main():
             colorama.just_fix_windows_console()
         except Exception:
             pass
-    # Colored, concise logging formatter
+
     class ColoredFormatter(logging.Formatter):
         COLORS = {
-            'DEBUG': '\x1b[36m',    # Cyan
-            'INFO': '\x1b[32m',     # Green
-            'WARNING': '\x1b[33m',  # Yellow
-            'ERROR': '\x1b[31m',    # Red
-            'CRITICAL': '\x1b[41m', # Red background
+            'DEBUG': '\x1b[36m',
+            'INFO': '\x1b[32m',
+            'WARNING': '\x1b[33m',
+            'ERROR': '\x1b[31m',
+            'CRITICAL': '\x1b[41m',
         }
         RESET = '\x1b[0m'
 
@@ -36,20 +36,20 @@ def main():
             level = record.levelname
             color = self.COLORS.get(level, '')
             reset = self.RESET if color else ''
-            # Compact example: [12:34:56] [INFO] Message
+
             fmt = f"%(asctime)s [%(levelname)s] %(message)s"
-            # Time only
+
             datefmt = "%H:%M:%S"
             base = logging.Formatter(fmt=fmt, datefmt=datefmt)
             msg = base.format(record)
             if color:
-                # Color only the [LEVEL] part
+
                 msg = msg.replace(f"[{level}]", f"{color}[{level}]{reset}")
             return msg
 
     root = logging.getLogger()
     root.setLevel(logging.INFO)
-    # Clean existing handlers to avoid duplicate logs
+
     for h in list(root.handlers):
         root.removeHandler(h)
     ch = logging.StreamHandler()
@@ -57,9 +57,9 @@ def main():
     ch.setFormatter(ColoredFormatter())
     root.addHandler(ch)
 
-    # Suppress noisy third-party loggers
+
     logging.getLogger('werkzeug').setLevel(logging.WARNING)
-    # Вернём aiogram.event на INFO, но переведём сообщения фильтром ниже
+
     aio_event_logger = logging.getLogger('aiogram.event')
     aio_event_logger.setLevel(logging.INFO)
     logging.getLogger('aiogram.dispatcher').setLevel(logging.WARNING)
@@ -72,8 +72,8 @@ def main():
             try:
                 msg = record.getMessage()
                 if 'Update id=' in msg:
-                    # Пример исходной строки:
-                    # "Update id=236398370 is handled. Duration 877 ms by bot id=8241346998"
+
+
                     m = re.search(r"Update id=(\d+)\s+is\s+(not handled|handled)\.\s+Duration\s+(\d+)\s+ms\s+by bot id=(\d+)", msg)
                     if m:
                         upd_id, state, dur_ms, bot_id = m.groups()
@@ -82,7 +82,7 @@ def main():
                         record.msg = msg
                         record.args = ()
                     else:
-                        # Фолбэк: минимальная русификация
+
                         msg = msg.replace('Update id=', 'Обновление ')
                         msg = msg.replace(' is handled.', ' обработано.')
                         msg = msg.replace(' is not handled.', ' не обработано.')
@@ -96,12 +96,13 @@ def main():
                 pass
             return True
 
-    # Навешиваем фильтр только на aiogram.event
+
     aio_event_logger.addFilter(RussianizeAiogramFilter())
     logger = logging.getLogger(__name__)
 
-    database.initialize_db()
-    logger.info("Проверка инициализации базы данных завершена.")
+    logger.info("Инициализация базы данных...")
+    rw_repo.initialize_db()
+    logger.info("Инициализация базы данных завершена.")
 
     bot_controller = BotController()
     flask_app = create_webhook_app(bot_controller)
@@ -137,19 +138,19 @@ def main():
         
         asyncio.create_task(periodic_subscription_check(bot_controller))
 
-        # Бесконечное ожидание в мягком цикле сна, чтобы корректно ловить отмену без трейсбека
+
         try:
             while True:
                 await asyncio.sleep(3600)
         except asyncio.CancelledError:
-            # Нормальное завершение: заглушаем исключение отмены
+
             logger.info("Главная задача отменена, выполняю корректное завершение...")
             return
 
     try:
         asyncio.run(start_services())
     except asyncio.CancelledError:
-        # Может всплыть при остановке цикла — игнорируем как штатное поведение
+
         logger.info("Получен сигнал остановки, сервисы остановлены.")
     finally:
         logger.info("Приложение завершается.")
