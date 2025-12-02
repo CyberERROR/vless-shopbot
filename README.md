@@ -11,7 +11,7 @@
 ![GitHub Issues or Pull Requests](https://img.shields.io/github/issues/CyberERROR/vless-shopbot)
 ![GitHub Stars](https://img.shields.io/github/stars/CyberERROR/vless-shopbot?style=flat)
 
-</div>
+</div> 
 
 **VLESS Shop Bot** — это комплексное решение для автоматизированной продажи VLESS-конфигураций через Telegram. Бот глубоко интегрирован с панелью управления **3x-ui** и предоставляет мощную веб-панель для полного контроля над вашим бизнесом.
 
