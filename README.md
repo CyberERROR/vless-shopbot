@@ -160,14 +160,12 @@ curl -sSL https://raw.githubusercontent.com/CyberERROR/vless-shopbot/main/instal
 
 Если вы нашли баг, или у вас есть предложение, то создавайте "Issue" или присылайте Pull Request'ы.
 
-## 💎 Поддержать разработку
+--- 
 
-**СБП/Карта РФ:** https://yookassa.ru/my/i/aJRiTyq5D3VB/l
+<div align="center">
 
-**CryptoBot:** https://t.me/send?start=IVftnggXmRv8
+## 💎 Автор исходного кода, и все права принадлежат - [tweopi](https://github.com/tweopi)
 
-**TON:** `UQAtdMEig3Wl_D3FNx4RU3RhxnoJI3IizGxrrNj3O8Q-fDpK`
+## 📄 Лицензия Проект распространяется по лицензии [GPLv3](LICENSE).
 
-**USDT (TRC20):** `TBW9TFUh93U1G5eTT1VTsZw51L669khCiz`
-
-## Я ценю любой вклад в развитие проекта ❤️
+---
